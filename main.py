@@ -175,22 +175,30 @@ def _resumo_payload(secao: str, payload: dict) -> None:
     tempo   = f"({elapsed:.1f}s) " if elapsed is not None else ""
 
     if secao == "WORKER":
-        arquivo = payload.get("nome_arquivo") or payload.get("caminho_boleto") or ""
-        if arquivo:
-            arquivo = os.path.basename(str(arquivo))
+        # Caminho COMPLETO do boleto/evidencia (nao apenas o nome do arquivo).
+        caminho = (
+            payload.get("caminho_boleto")
+            or payload.get("caminho_evidencia_falha")
+            or payload.get("caminho_evidencia")
+            or payload.get("nome_arquivo")
+            or ""
+        )
+        caminho = str(caminho).strip()
 
-        if status == "BAIXADO":
-            _imprimir(secao, f"✓ BAIXADO {tempo}→ {arquivo or obs or '(sem nome)'}")
-        elif status == "ADIANTADO":
-            _imprimir(secao, f"~ ADIANTADO {tempo}→ {obs[:120] or '(sem obs)'}")
-        elif status == "NAO_BAIXADO":
-            _imprimir(secao, f"~ NAO_BAIXADO {tempo}→ {obs[:120] or '(sem obs)'}")
-        elif status == "FALHA":
-            retriable = bool(payload.get("retriable", False))
-            tag = " [retry]" if retriable else ""
-            _imprimir(secao, f"✗ FALHA{tag} {tempo}→ {obs[:120] or '(sem detalhes)'}")
-        else:
-            _imprimir(secao, f"? {status} {tempo}→ {obs[:120] or ''}")
+        simbolo = {
+            "BAIXADO": "✓",
+            "ADIANTADO": "~",
+            "NAO_BAIXADO": "~",
+            "FALHA": "✗",
+        }.get(status, "?")
+
+        retriable = bool(payload.get("retriable", False))
+        tag = " [retry]" if (status == "FALHA" and retriable) else ""
+
+        # Sempre imprime as tres informacoes pedidas: status, caminho completo e observacao.
+        _imprimir(secao, f"{simbolo} STATUS: {status}{tag} {tempo}".rstrip())
+        _imprimir(secao, f"    CAMINHO: {caminho or '(sem caminho)'}")
+        _imprimir(secao, f"    OBSERVACAO: {obs or '(sem observacao)'}")
 
         # Cotas não selecionadas — motivo por cota (útil para diagnóstico).
         for ns in (payload.get("cotas_nao_selecionadas") or []):
@@ -207,13 +215,13 @@ def _resumo_payload(secao: str, payload: dict) -> None:
         if status == "SUCESSO":
             _imprimir(secao, "✓ Login realizado com sucesso")
         else:
-            _imprimir(secao, f"✗ FALHA → {obs[:120] or status}")
+            _imprimir(secao, f"✗ FALHA → {obs or status}")
 
     elif secao == "ENTRADA":
         if status in ("SUCESSO", "SEM_LOTE", "SEM_COTAS"):
-            _imprimir(secao, f"✓ {status}" + (f" → {obs[:100]}" if obs else ""))
+            _imprimir(secao, f"✓ {status}" + (f" → {obs}" if obs else ""))
         else:
-            _imprimir(secao, f"✗ {status} → {obs[:120] or '(sem obs)'}")
+            _imprimir(secao, f"✗ {status} → {obs or '(sem obs)'}")
 
     elif secao == "SAIDA":
         if status == "SUCESSO":
@@ -223,10 +231,10 @@ def _resumo_payload(secao: str, payload: dict) -> None:
             extra += f" | {metr}" if metr else ""
             _imprimir(secao, f"✓ SUCESSO{extra}")
         else:
-            _imprimir(secao, f"✗ {status} → {obs[:120] or '(sem obs)'}")
+            _imprimir(secao, f"✗ {status} → {obs or '(sem obs)'}")
 
     else:
-        _imprimir(secao, f"{status}" + (f" → {obs[:120]}" if obs else ""))
+        _imprimir(secao, f"{status}" + (f" → {obs}" if obs else ""))
 
 
 def _imprimir_nao_encontradas_novas(nome_cliente_atual, novos_registros):
@@ -329,23 +337,42 @@ def _rodar_script(secao, script_path, argv_extras, timeout_s=300):
         # O orquestrador trata a parada via flag _PARAR — o worker termina
         # normalmente e so entao o loop verifica a flag e para.
         _creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=None,            # herda stderr do processo pai → terminal live
             text=True, encoding="utf-8",
-            errors="replace", timeout=timeout_s, cwd=ROOT_DIR,
+            errors="replace", cwd=ROOT_DIR,
             creationflags=_creationflags,
         )
+        try:
+            stdout_capturado, _ = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            # Mata a ARVORE inteira (python + driver node do playwright).
+            # kill() puro deixa o node vivo segurando o pipe de stdout e a
+            # limpeza do subprocess trava PARA SEMPRE (orquestrador congela).
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            except Exception:
+                pass
+            try:
+                proc.communicate(timeout=15)
+            except Exception:
+                pass
+            raise subprocess.TimeoutExpired(cmd, timeout_s)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"{secao} excedeu timeout de {timeout_s}s")
     elapsed = time.monotonic() - t0
 
-    payload = _extrair_json_da_saida(proc.stdout)
+    payload = _extrair_json_da_saida(stdout_capturado)
     if payload is None:
         raise RuntimeError(
             f"{secao} nao retornou JSON valido. exit_code={proc.returncode}. "
-            f"stdout (ult. 500): {(proc.stdout or '')[-500:]!r}"
+            f"stdout (ult. 500): {(stdout_capturado or '')[-500:]!r}"
         )
 
     payload["_elapsed_s"] = round(elapsed, 1)

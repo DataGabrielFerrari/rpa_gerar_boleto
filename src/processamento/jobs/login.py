@@ -649,10 +649,16 @@ def _executar_login(id_fila_adm: int) -> str:
     _matar_edge_total()
 
     _log(caminho_log, id_fila_adm, "Abrindo Edge limpo com CDP")
+    # IMPORTANTE: Edge/Chromium recentes BLOQUEIAM --remote-debugging-port
+    # no perfil padrao do usuario (mudanca de seguranca do Chromium ~2025).
+    # Perfil dedicado via --user-data-dir e obrigatorio para o CDP subir.
+    user_data_dir = os.path.join(ROOT_DIR, "credenciais", "edge_cdp_profile")
+    os.makedirs(user_data_dir, exist_ok=True)
     subprocess.Popen(
         [
             edge_path,
             f"--remote-debugging-port={PORTA_DEBUG}",
+            f"--user-data-dir={user_data_dir}",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-popup-blocking",
@@ -665,7 +671,7 @@ def _executar_login(id_fila_adm: int) -> str:
         stderr=subprocess.DEVNULL,
     )
 
-    if not _esperar_cdp(PORTA_DEBUG, 20):
+    if not _esperar_cdp(PORTA_DEBUG, 30):
         raise RuntimeError(f"Edge nao abriu CDP na porta {PORTA_DEBUG}")
 
     _log(caminho_log, id_fila_adm, "CDP disponivel - conectando Playwright")

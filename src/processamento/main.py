@@ -326,7 +326,13 @@ def _print_falha(page, pasta_destino: Path, prefixo: str) -> Optional[str]:
     try:
         pasta_destino.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Encurta o prefixo para caber no MAX_PATH do Windows (260)
+        prefixo = str(prefixo)[:60].rstrip()
         destino = pasta_destino / f"{prefixo}_{ts}.png"
+        if len(str(destino)) > 240:
+            corte = len(str(destino)) - 240
+            prefixo = prefixo[: max(10, len(prefixo) - corte)].rstrip()
+            destino = pasta_destino / f"{prefixo}_{ts}.png"
         page.screenshot(path=str(destino), full_page=True)
         _log_evidencia(destino, "FALHA")
         return str(destino)
@@ -389,7 +395,13 @@ def _print_adiantado(page, pasta_destino: Path, prefixo: str) -> Optional[str]:
     try:
         pasta_destino.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Encurta o prefixo para caber no MAX_PATH do Windows (260)
+        prefixo = str(prefixo)[:60].rstrip()
         destino = pasta_destino / f"{prefixo}_{ts}.png"
+        if len(str(destino)) > 240:
+            corte = len(str(destino)) - 240
+            prefixo = prefixo[: max(10, len(prefixo) - corte)].rstrip()
+            destino = pasta_destino / f"{prefixo}_{ts}.png"
         # full_page=False pra ser rapido (toast some em ~5s)
         page.screenshot(path=str(destino), full_page=False)
         _log_evidencia(destino, "ADIANTADO")
@@ -693,12 +705,16 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
     # Fica em NAO_BAIXADOS/3 - Cotas não encontradas/{cliente}/ para
     # diferenciar de NAO_BAIXADOS genericos (valor zero, modalidade errada, etc.)
     pasta_nao_encontrada = pasta_cotas_nao_encontradas_cota(caminho_base, nome_cliente, grupo, cota)
+    _log(caminho_log, id_cota, "[PASSO] Mapeando cotas do lote (banco)")
     lote_map = _mapear_cotas_do_lote(id_fila_adm, id_cota_primaria=id_cota)
+    _log(caminho_log, id_cota, "[PASSO] Iniciando Playwright")
 
     with sync_playwright() as p:
         # --- conecta ao Edge (CDP) ---
         try:
+            _log(caminho_log, id_cota, "[PASSO] Conectando ao Edge via CDP (porta 9222)")
             browser, context = conectar_ao_edge(p)
+            _log(caminho_log, id_cota, "[PASSO] Conectado ao Edge via CDP")
         except Exception as e:
             _log_err(caminho_log, id_cota, "CDP indisponivel", f"{e}")
             return _payload(
@@ -707,7 +723,9 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
             )
 
         page = achar_aba_avapro(context)
+        _log(caminho_log, id_cota, "[PASSO] Aba AVAPRO selecionada", f"url={page.url}")
         page.bring_to_front()
+        _log(caminho_log, id_cota, "[PASSO] Aba trazida para frente")
 
         # --- garante /meus-clientes ---
         try:

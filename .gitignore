@@ -2,10 +2,15 @@
 # SEGURANCA — NUNCA VERSIONAR (credenciais e segredos)
 # ============================================================
 credentials/
+credenciais/
 token.json
 client_secret*.json
 *.pem
 *.key
+
+# Perfil do navegador Edge (CDP) — gerado automaticamente, pesado, contem sessao/login
+credenciais/edge_cdp_profile/
+**/edge_cdp_profile/
 
 # Dados gerados em producao (nao e codigo)
 lotes/
@@ -29,8 +34,10 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# ATENCAO: ancorado na raiz (/lib/) — sem a barra inicial isso ignoraria
+# TAMBEM src/processamento/lib/ (codigo do RPA). Nao remover a barra.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
