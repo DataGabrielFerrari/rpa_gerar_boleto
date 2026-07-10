@@ -62,6 +62,21 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.dirname(CURRENT_DIR)
 ROOT_DIR = os.path.dirname(SRC_DIR)
 
+# Arquivo de "passo atual" do worker. O worker grava aqui a etapa em que esta;
+# se o orquestrador matar o worker por timeout, ele le este arquivo para montar
+# uma observacao ESPECIFICA (ex: "timeout ao clicar em 'Gerar boleto'") em vez
+# do generico "excedeu timeout".
+PASSO_FILE = os.path.join(ROOT_DIR, ".rpa_worker_passo.txt")
+
+
+def _registrar_passo(id_cota, passo: str) -> None:
+    """Grava a etapa atual do worker (para diagnostico de timeout)."""
+    try:
+        with open(PASSO_FILE, "w", encoding="utf-8") as _f:
+            _f.write(f"{id_cota}|{passo}")
+    except Exception:
+        pass
+
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
@@ -83,6 +98,7 @@ from shared.sql_funcoes import (
     aplicar_finalizacoes_lote,
     inserir_cota_nao_encontrada,
     listar_cotas_nao_encontradas,
+    marcar_cota_ja_baixada_reunificada,
 )
 
 from processamento.lib.navegador import (
@@ -539,7 +555,7 @@ def _mapear_chaves_lote_completo(id_fila_adm: int) -> Dict[tuple, Dict[str, Any]
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id_cota, grupo, cota, status
+                SELECT id_cota, grupo, cota, status, caminho_boleto, pode_unificar
                 FROM tbl_fila_cotas
                 WHERE id_fila_adm = %s
                 """,
@@ -551,6 +567,8 @@ def _mapear_chaves_lote_completo(id_fila_adm: int) -> Dict[tuple, Dict[str, Any]
                 mapa.setdefault((g6, c4), {
                     "id_cota": r[0],
                     "status": str(r[3] or "").upper(),
+                    "caminho_boleto": r[4],
+                    "pode_unificar": str(r[5] or "").strip() if r[5] is not None else None,
                 })
     return mapa
 
@@ -909,6 +927,9 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
         selecionaveis: List[Dict[str, Any]] = []
         candidatos_nao_encontradas: List[tuple] = []
         ja_processadas: List[tuple] = []
+        # Cotas ja BAIXADAS que reaparecem: bloqueiam no modal (evita dupla
+        # emissao). chave (g6,c4) -> {id_cota, caminho_boleto}.
+        cotas_baixadas_bloqueadas: Dict[tuple, Dict[str, Any]] = {}
         # Rastreamento de diagnóstico para o terminal.
         _nao_selecionadas_info: List[Dict[str, str]] = []
         for c in cotas_tela:
@@ -956,11 +977,54 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
                     })
             elif chave in chaves_lote_completo:
                 # Esta no lote mas ja foi finalizada num run anterior.
-                # Anexa nota idempotente na observacao da cota processada.
                 info = chaves_lote_completo[chave]
                 id_cota_processada = info["id_cota"]
                 status_anterior = info["status"]
-                ja_processadas.append((c["grupo"], c["cota"], status_anterior))
+
+                # Bloqueia se JA foi baixada: status BAIXADO OU caminho_boleto
+                # preenchido (cobre inclusive registros ja marcados FALHA por
+                # esta mesma regra em execucoes anteriores — protecao permanente).
+                if status_anterior == "BAIXADO" or info.get("caminho_boleto"):
+                    # JA BAIXADA num boleto anterior. NAO pode ser reselecionada
+                    # (evita dupla emissao). Registra para bloquear no modal e
+                    # depois marcar FALHA com observacao especifica.
+                    cotas_baixadas_bloqueadas[chave] = {
+                        "id_cota": id_cota_processada,
+                        "caminho_boleto": info.get("caminho_boleto"),
+                    }
+                    ja_processadas.append((c["grupo"], c["cota"], status_anterior))
+                    _log(
+                        caminho_log, id_cota,
+                        "Cota ja BAIXADA reapareceu — sera bloqueada no modal",
+                        f"grupo={c['grupo']} cota={c['cota']} "
+                        f"boleto_anterior={info.get('caminho_boleto')!r}",
+                    )
+                elif status_anterior == "NAO_BAIXADO":
+                    # Nao esta pendente mas NAO foi baixada: pode ser unificada
+                    # de novo (regra: se apareceu no sistema, unifica junto).
+                    # Passa pelo fluxo normal de selecao — que retrata excluido/
+                    # modalidade errada e salva print em NAO_BAIXADOS se for o caso.
+                    _pu_nb = (info.get("pode_unificar") or "Sim").strip().lower()
+                    _esta_pode_nb = _pu_nb not in ("nao", "não", "n", "false", "0")
+                    if _primaria_pode_unificar and _esta_pode_nb:
+                        selecionaveis.append({
+                            "id_cota": id_cota_processada,
+                            "grupo": c["grupo"],
+                            "cota": c["cota"],
+                            "atraso": None,
+                        })
+                        _log(
+                            caminho_log, id_cota,
+                            "Cota NAO_BAIXADA reincluida na unificacao",
+                            f"grupo={c['grupo']} cota={c['cota']} "
+                            f"id_cota_reincluida={id_cota_processada}",
+                        )
+                    else:
+                        ja_processadas.append((c["grupo"], c["cota"], status_anterior))
+                else:
+                    # ADIANTADO / FALHA / PROCESSANDO: mantem comportamento atual
+                    # (apenas anota reaparecimento, nao reprocessa).
+                    ja_processadas.append((c["grupo"], c["cota"], status_anterior))
             else:
                 # Nao existe no lote em status nenhum.
                 # NAO inserimos direto - antes precisamos checar a modalidade
@@ -1352,6 +1416,22 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
                         f"vencimento={venc_str_s!r}",
                     )
 
+                # Rede de seguranca: se o vencimento NAO foi classificado
+                # (mod_cota_s=None), decide pelo SEGMENTO do card (Imoveis x
+                # Veiculos), que o AVAPRO mostra explicitamente. Sem isso, uma
+                # cota de Veiculos (MOTORS) acabava selecionada num lote IMOVEL.
+                if mod_cota_s is None:
+                    try:
+                        _seg_imoveis = avapro.verificar_imoveis_no_card(page, card)
+                        mod_cota_s = "IMOVEL" if _seg_imoveis else "MOTORS"
+                        _log(
+                            caminho_log, id_cota,
+                            "Modalidade inferida pelo segmento do card (vencimento indisponivel)",
+                            f"grupo={g} cota={c} imoveis={_seg_imoveis} mod={mod_cota_s}",
+                        )
+                    except Exception:
+                        pass
+
                 if mod_cota_s and modalidade_lote and mod_cota_s != modalidade_lote:
                     # Vencimento revela que esta cota pertence a OUTRA modalidade.
                     # Nao marca checkbox, nao emite boleto.
@@ -1405,6 +1485,7 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
                 continue  # Nao marca checkbox — cota sera finalizada como NAO_BAIXADO
 
             try:
+                _registrar_passo(id_cota, f"marcando checkbox da cota {g}/{c} na tela do cliente")
                 avapro.marcar_checkbox_cota(
                     page, g, c,
                     log_fn=lambda acao, detalhe="": _log(caminho_log, id_cota, acao, detalhe),
@@ -1568,6 +1649,7 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
         _snapshot_time = time.time()
 
         # --- Clica "Emitir boleto" (botao primario do card) ---
+        _registrar_passo(id_cota, "clicando em 'Emitir boleto'")
         avapro.clicar_baixar_documentos_emitir_boleto(
             page,
             log_fn=lambda acao, detalhe="": _log(caminho_log, id_cota, acao, detalhe),
@@ -1684,9 +1766,11 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
             # O retry_cb (verificacao de checkboxes antes da data ser alterada)
             # foi removido pois interferia quando o modal abria com
             # "Nenhuma parcela disponivel" (Venc. boleto = Hoje).
+            _registrar_passo(id_cota, "selecionando parcelas no modal de emissao")
             _modal_result = avapro.selecionar_parcelas_no_modal(
                 page, _data_ref_do_lote(ctx),
                 modalidade=ctx.get("modalidade", "IMOVEL"),
+                cotas_bloqueadas=set(cotas_baixadas_bloqueadas.keys()),
             )
             _log_tempo(caminho_log, id_cota, "modal_parcelas_concluido", t0)
 
@@ -1905,6 +1989,7 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
 
         # --- Clica "Continuar" no modal → tela de resumo → "Baixar" → download ---
         try:
+            _registrar_passo(id_cota, "clicando em 'Gerar boleto' (confirmar parcelas do modal)")
             avapro.clicar_continuar_modal_parcelas(page)
             _log_tempo(caminho_log, id_cota, "continuar_clicado", t0)
             _log(caminho_log, id_cota, "Continuar clicado no modal de parcelas", "")
@@ -1940,6 +2025,7 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
             # no bloco de retry abaixo.
 
             # Le dados do modal "Pagamento"
+            _registrar_passo(id_cota, "baixando o boleto (tela de pagamento / download do PDF)")
             _t_antes_pagamento = time.time()
             _dados_pag = avapro.ler_dados_modal_pagamento(page, timeout_ms=5000)
             _log_tempo(caminho_log, id_cota, "modal_pagamento_lido", t0)
@@ -2617,6 +2703,34 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
                 s["id_cota"], "BAIXADO", obs,
                 caminho_boleto=str(destino_arq), parcelas_atraso=s.get("atraso"),
             ))
+
+        # --- Cotas ja BAIXADAS que o AVAPRO reexibiu no modal de unificacao ---
+        # NAO tiveram parcela selecionada (dupla emissao evitada). Registra a
+        # ocorrencia com observacao especifica referenciando o boleto anterior
+        # (X) e o boleto atual (Y = destino_arq).
+        for _chave_bloq in (_modal_result.get("cotas_bloqueadas_baixadas") or []):
+            _info_bloq = cotas_baixadas_bloqueadas.get(_chave_bloq) or {}
+            _id_bloq = _info_bloq.get("id_cota")
+            _boleto_x = _info_bloq.get("caminho_boleto") or "(caminho nao registrado)"
+            _obs_bloq = (
+                f"Cota foi baixada no boleto de caminho {_boleto_x} e apareceu "
+                f"para unificar novamente na hora de unificar as parcelas no "
+                f"boleto {destino_arq}; parcela NAO reselecionada (dupla emissao evitada)."
+            )
+            if _id_bloq:
+                try:
+                    marcar_cota_ja_baixada_reunificada(_id_bloq, _obs_bloq)
+                except Exception as _e_bloq:
+                    _log_err(
+                        caminho_log, id_cota,
+                        "Falha ao registrar cota ja baixada reexibida",
+                        f"chave={_chave_bloq} id_cota={_id_bloq}: {_e_bloq}",
+                    )
+            _log(
+                caminho_log, id_cota,
+                "Cota ja BAIXADA bloqueada no modal (dupla emissao evitada)",
+                f"chave={_chave_bloq} boleto_anterior={_boleto_x} boleto_atual={destino_arq}",
+            )
 
         if id_cota not in sel_ids:
             # O PDF foi baixado — a cota primaria foi processada mesmo que

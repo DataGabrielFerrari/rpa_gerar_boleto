@@ -571,6 +571,34 @@ def marcar_cota_reaparecida(
     return afetadas > 0
 
 
+def marcar_cota_ja_baixada_reunificada(id_cota: int, observacao: str) -> None:
+    """
+    Marca uma cota JA BAIXADA que reapareceu no modal de unificacao como FALHA,
+    gravando a observacao especifica (referencia o boleto anterior X e o boleto
+    atual Y), MAS PRESERVA o campo caminho_boleto.
+
+    Preservar caminho_boleto e essencial: mesmo com status FALHA, o guard de
+    dupla emissao (que bloqueia cotas com caminho_boleto ja preenchido) continua
+    protegendo essa cota em execucoes futuras — evita reemitir o boleto.
+
+    Nao usa a SQL function finalizar_cota_falha porque ela poderia zerar o
+    caminho_boleto; aqui fazemos UPDATE direto de status + observacao apenas.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tbl_fila_cotas
+                SET status = 'FALHA',
+                    observacao = %s,
+                    data_atualizacao = NOW()
+                WHERE id_cota = %s
+                """,
+                (observacao, id_cota),
+            )
+        conn.commit()
+
+
 # ============================================================
 # UTILITARIOS
 # ============================================================

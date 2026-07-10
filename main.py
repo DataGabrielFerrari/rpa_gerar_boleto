@@ -124,6 +124,24 @@ except Exception:
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
 
+# Arquivo onde o worker grava a etapa atual (ver src/processamento/main.py).
+# Usado para montar observacao ESPECIFICA de timeout (qual botao/etapa).
+PASSO_FILE = os.path.join(ROOT_DIR, ".rpa_worker_passo.txt")
+
+
+def _ler_passo_worker(id_cota) -> str:
+    """Le a etapa em que o worker estava. Retorna '' se nao houver/for de outra cota."""
+    try:
+        with open(PASSO_FILE, "r", encoding="utf-8") as _f:
+            conteudo = _f.read().strip()
+        if "|" in conteudo:
+            _id_str, _passo = conteudo.split("|", 1)
+            if str(_id_str).strip() == str(id_cota).strip():
+                return _passo.strip()
+    except Exception:
+        pass
+    return ""
+
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
@@ -148,7 +166,7 @@ MAX_TENTATIVAS_COTA = 2
 # Timeouts de subprocess (segundos).
 TIMEOUT_ENTRADA_S = 120
 TIMEOUT_LOGIN_S = 180
-TIMEOUT_WORKER_S = 180
+TIMEOUT_WORKER_S = 600  # antes 180s: curto p/ clientes com muitas cotas (unificacao)
 TIMEOUT_SAIDA_S = 600
 
 
@@ -422,11 +440,79 @@ def _validar_modalidade(arg):
 # com logica de retry via novos registros no banco.
 # ============================================================
 
+def _capturar_print_timeout_cdp(
+    caminho_base: Optional[str],
+    nome_cliente: Optional[str],
+    grupo: Optional[str],
+    cota: Optional[str],
+) -> Optional[str]:
+    """
+    Captura um screenshot da tela travada APOS o worker estourar o timeout.
+
+    O worker roda como subprocesso e conecta no Edge via CDP (porta 9222).
+    Quando o worker excede o timeout, o orquestrador mata o SUBPROCESSO, mas
+    o Edge (processo separado, aberto pelo login) continua vivo com a tela
+    travada visivel. Aqui o orquestrador reconecta no mesmo Edge via CDP e
+    fotografa a pagina, salvando na pasta FALHAS da cota.
+
+    Retorna o caminho do PNG salvo, ou None se nao conseguiu capturar.
+    Nao fecha o Edge (usa conexao CDP; sair do contexto apenas desconecta).
+    """
+    if not caminho_base:
+        _imprimir_err("MAIN", "  print timeout: sem caminho_base — nao capturou")
+        return None
+    try:
+        from playwright.sync_api import sync_playwright
+        from processamento.lib.navegador import conectar_ao_edge, cdp_disponivel
+        from processamento.lib.arquivos import pasta_falha_cota
+        from datetime import datetime as _dt
+    except Exception as e:
+        _imprimir_err("MAIN", f"  print timeout: import falhou: {e}")
+        return None
+
+    if not cdp_disponivel(timeout=5):
+        _imprimir_err("MAIN", "  print timeout: CDP indisponivel (Edge fechou?)")
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser, context = conectar_ao_edge(p)
+            # Escolhe a aba do AVAPRO SEM fechar as demais (preserva o estado travado).
+            page = None
+            for pg in context.pages:
+                try:
+                    if "avapro" in (pg.url or "").lower():
+                        page = pg
+                        break
+                except Exception:
+                    continue
+            if page is None and context.pages:
+                page = context.pages[0]
+            if page is None:
+                _imprimir_err("MAIN", "  print timeout: nenhuma aba no Edge")
+                return None
+
+            pasta = pasta_falha_cota(caminho_base, nome_cliente or "", grupo, cota)
+            pasta.mkdir(parents=True, exist_ok=True)
+            ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+            destino = pasta / f"FALHA_Timeout_Worker_{ts}.png"
+            page.screenshot(path=str(destino), full_page=True)
+            # NAO chama browser.close() — fecharia o Edge. Sair do 'with' so desconecta.
+            return str(destino)
+    except Exception as e:
+        _imprimir_err("MAIN", f"  print timeout: falha ao capturar: {e}")
+        return None
+
+
 def _processar_cota_uma_vez(
     id_cota: int,
     tentativa: int,
     id_fila_adm: int,
     caminho_log: Optional[str],
+    nome_cliente: Optional[str] = None,
+    grupo: Optional[str] = None,
+    cota: Optional[str] = None,
+    caminho_base: Optional[str] = None,
 ) -> tuple:
     """
     Executa o worker para uma cota e gerencia o resultado.
@@ -457,10 +543,24 @@ def _processar_cota_uma_vez(
     except RuntimeError as e:
         # Subprocess estourou (timeout / sem JSON): transitorio.
         worker_erro = str(e)
+        # Observacao ESPECIFICA: acrescenta a etapa em que o worker travou
+        # (ex: "clicando em 'Gerar boleto'"), lida do arquivo de passo.
+        _passo_worker = _ler_passo_worker(id_cota)
+        if _passo_worker:
+            worker_erro = f"{worker_erro} — etapa: {_passo_worker}"
         _imprimir_err("MAIN", f"Worker estourou (cota {id_cota}, "
-                              f"tentativa {tentativa}/{MAX_TENTATIVAS_COTA}): {e}")
+                              f"tentativa {tentativa}/{MAX_TENTATIVAS_COTA}): {worker_erro}")
         status, retriable = "FALHA", True
         payload = {"status": "FALHA", "retriable": True, "observacao": worker_erro}
+
+        # Toda FALHA deve ter print: o Edge segue vivo (CDP) apos matar o worker,
+        # entao capturamos a tela travada e anexamos a evidencia a FALHA.
+        _print_timeout = _capturar_print_timeout_cdp(
+            caminho_base, nome_cliente, grupo, cota
+        )
+        if _print_timeout:
+            payload["caminho_evidencia_falha"] = _print_timeout
+            _imprimir("MAIN", f"  📸 print da falha (timeout) salvo: {_print_timeout}")
 
     obs = (payload.get("observacao") or worker_erro or "")[:200]
 
@@ -537,6 +637,14 @@ def _processar_cota_uma_vez(
         return "FALHA", True
 
     # --- Ultima tentativa: FALHA definitiva com formato [N/N] ---
+    # Rede de seguranca: TODA FALHA definitiva deve ter print. Se ainda nao ha
+    # evidencia (ex: worker retornou FALHA sem screenshot), captura via CDP.
+    if not evidencia:
+        _ev_cdp = _capturar_print_timeout_cdp(caminho_base, nome_cliente, grupo, cota)
+        if _ev_cdp:
+            evidencia = _ev_cdp
+            _imprimir("MAIN", f"  📸 print da FALHA definitiva salvo: {_ev_cdp}")
+
     obs_final = f"FALHA [{tentativa}/{MAX_TENTATIVAS_COTA}] — {obs}"
     _imprimir_err("MAIN",
                   f"Cota {id_cota} esgotou {MAX_TENTATIVAS_COTA} tentativas. "
@@ -904,6 +1012,10 @@ def main():
                 tentativa=tentativa,
                 id_fila_adm=id_fila_adm,
                 caminho_log=caminho_log,
+                nome_cliente=nome_cliente,
+                grupo=grupo,
+                cota=cota,
+                caminho_base=caminho_base,
             )
             resumo[status_final] = resumo.get(status_final, 0) + 1
 

@@ -301,10 +301,17 @@ def _atualizar_aba(
             cores_por_linha.append((row_num, _rgb))
 
         if col_obs is not None:
+            # Na planilha, FALHA mostra apenas o prefixo generico "FALHA [x/y]".
+            # O detalhe especifico (etapa/botao do timeout) fica so no banco.
+            _obs_planilha = obs if obs is not None else ""
+            if _status_upper == "FALHA" and _obs_planilha:
+                _m_falha = re.match(r"\s*(FALHA\s*\[\d+\s*/\s*\d+\])", _obs_planilha)
+                if _m_falha:
+                    _obs_planilha = _m_falha.group(1)
             updates.append(
                 {
                     "range": f"'{aba}'!{col_obs}{row_num}",
-                    "values": [[obs if obs is not None else ""]],
+                    "values": [[_obs_planilha]],
                 }
             )
             updated_obs += 1

@@ -1466,7 +1466,29 @@ def _alterar_data_base_modal(
             ).first
         _btn_dia.wait_for(state="visible", timeout=3000)
         _btn_dia.click(timeout=3000)
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(400)
+
+        # --- VERIFICA que o campo passou a refletir a data escolhida ---
+        # Sem isso, uma falha silenciosa deixava o campo em "Hoje" e o robo
+        # seguia selecionando parcelas com a data errada.
+        try:
+            _txt_btn = (_btn_data.inner_text(timeout=2000) or "").strip().lower()
+        except Exception:
+            _txt_btn = ""
+        _dd = f"{dia:02d}"
+        _mm = f"{mes:02d}"
+        _confirmou = (
+            (_dd in _txt_btn and _mm in _txt_btn)
+            or (f"{dia}/{mes}" in _txt_btn)
+            or (str(ano) in _txt_btn and _mm in _txt_btn)
+        )
+        if not _confirmou:
+            # Campo nao refletiu a data -> considera falha (quem chama retenta)
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return None
         return datetime(ano, mes, dia)
 
     except Exception:
@@ -1514,6 +1536,7 @@ def selecionar_parcelas_no_modal(
     page,
     data_ref: Optional[datetime] = None,
     modalidade: str = "IMOVEL",
+    cotas_bloqueadas: Optional[set] = None,
 ) -> Dict[str, Any]:
     """
     Trata o modal 'Selecione as parcelas para emissao do boleto'.
@@ -1526,17 +1549,25 @@ def selecionar_parcelas_no_modal(
          Nao seleciona parcelas futuras.
       5. Se parcela do mes ref NAO encontrada → cota marcada como adiantada.
 
+    `cotas_bloqueadas`: conjunto de (grupo_zfill6, cota_zfill4) que JA estao
+    BAIXADAS num boleto anterior. O AVAPRO pode reexibi-las no modal de
+    unificacao; para essas NAO selecionamos parcela nenhuma (evita dupla
+    emissao). Elas sao devolvidas em resultado['cotas_bloqueadas_baixadas']
+    para o worker registrar a FALHA com observacao especifica.
+
     Retorna:
       {
         'por_cota': {(grupo, cota): {'parcelas_atraso', 'mes_ref_encontrado',
                                      'sem_detalhes', 'imoveis'}},
         'adiantados_modal': [(grupo, cota), ...],
+        'cotas_bloqueadas_baixadas': [(grupo, cota), ...],
         'total_selecionadas': int,
         'pode_continuar': bool,
         'erro': str|None,
         'erro_retriable': bool,  # True = problema de servidor (tentar de novo)
       }
     """
+    cotas_bloqueadas = cotas_bloqueadas or set()
     if data_ref is None:
         data_ref = datetime.now()
     mes_ref = data_ref.month
@@ -1551,6 +1582,7 @@ def selecionar_parcelas_no_modal(
     resultado: Dict[str, Any] = {
         "por_cota": {},
         "adiantados_modal": [],
+        "cotas_bloqueadas_baixadas": [],  # cotas ja BAIXADAS reexibidas no modal
         "total_selecionadas": 0,
         "pode_continuar": False,
         "erro": None,
@@ -1563,7 +1595,7 @@ def selecionar_parcelas_no_modal(
     try:
         page.locator(
             "h2:text-matches('Selecione as parcelas', 'i')"
-        ).first.wait_for(state="visible", timeout=90000)  # 1.5 minutos
+        ).first.wait_for(state="visible", timeout=30000)  # 30 segundos
     except Exception as e:
         # Antes de retornar erro generico, checa se o AVAPRO exibiu o dialog
         # de erro "Nao foi possivel carregar as parcelas" (erro 400 do servidor).
@@ -1574,7 +1606,7 @@ def selecionar_parcelas_no_modal(
             resultado["erro_retriable"] = True
             resultado["dialog_erro_aberto"] = True  # sinaliza: dialog ainda esta na tela
         else:
-            resultado["erro"] = f"Modal de selecao de parcelas nao apareceu apos 3 minutos: {e}"
+            resultado["erro"] = f"Modal de selecao de parcelas nao apareceu apos 30 segundos: {e}"
             resultado["modal_timeout"] = True  # timeout puro — sem dialog de erro
         return resultado
 
@@ -1584,29 +1616,60 @@ def selecionar_parcelas_no_modal(
     # mesmo que hoje seja antes do dia de vencimento.
     # A "Base pendencia" recebe A MESMA DATA do vencimento para que parcelas
     # de outros meses NAO aparecam na lista do modal.
-    if _calcular_vencimento is not None:
-        try:
-            _mes_ref_yyyymm = ano_ref * 100 + mes_ref
-            _venc_correto = _calcular_vencimento(_mes_ref_yyyymm, modalidade)
-            _dt_selecionada = _alterar_data_base_modal(
-                page, _venc_correto.day, _venc_correto.month, _venc_correto.year,
-                campo="venc_boleto",
-            )
-            if _dt_selecionada is not None:
-                resultado["vencimento_esperado_dt"] = _dt_selecionada
-            page.wait_for_timeout(300)
-            # Base pendencia = mesma data do vencimento (evita parcelas de
-            # outros meses). Se falhar (ex: dia ja passou e o calendario
-            # desabilita datas passadas), segue com a data base atual.
-            _dt_base = _alterar_data_base_modal(
-                page, _venc_correto.day, _venc_correto.month, _venc_correto.year,
-                campo="base_pendencia",
-            )
-            if _dt_base is not None:
-                resultado["base_pendencia_dt"] = _dt_base
-            page.wait_for_timeout(300)
-        except Exception:
-            pass
+    # PASSO OBRIGATORIO: definir "Venc. boleto" (e "Base pendencia") ANTES de
+    # ler/selecionar as parcelas. Se a data nao for aplicada, ABORTA como
+    # retriable em vez de emitir boleto com "Venc. boleto: Hoje".
+    if _calcular_vencimento is None:
+        resultado["erro"] = (
+            "calcular_vencimento indisponivel (import falhou) — nao da para "
+            "definir a data de vencimento do boleto com seguranca"
+        )
+        resultado["erro_retriable"] = True
+        return resultado
+
+    try:
+        _mes_ref_yyyymm = ano_ref * 100 + mes_ref
+        _venc_correto = _calcular_vencimento(_mes_ref_yyyymm, modalidade)
+    except Exception as _e_venc:
+        resultado["erro"] = f"Falha ao calcular vencimento: {_e_venc}"
+        resultado["erro_retriable"] = True
+        return resultado
+
+    # 1) Venc. boleto — obrigatorio, ate 3 tentativas com verificacao
+    _dt_selecionada = None
+    for _tent_venc in range(3):
+        _dt_selecionada = _alterar_data_base_modal(
+            page, _venc_correto.day, _venc_correto.month, _venc_correto.year,
+            campo="venc_boleto",
+        )
+        if _dt_selecionada is not None:
+            break
+        page.wait_for_timeout(400)
+    if _dt_selecionada is None:
+        resultado["erro"] = (
+            "Nao consegui definir 'Venc. boleto' para "
+            f"{_venc_correto.strftime('%d/%m/%Y')} apos 3 tentativas"
+        )
+        resultado["erro_retriable"] = True
+        return resultado
+    resultado["vencimento_esperado_dt"] = _dt_selecionada
+    page.wait_for_timeout(300)
+
+    # 2) Base pendencia = mesma data do vencimento (evita parcelas de outros
+    #    meses). NAO-FATAL: se o dia ja passou o calendario pode bloquear datas
+    #    passadas; nesse caso segue com a base atual.
+    _dt_base = None
+    for _tent_base in range(2):
+        _dt_base = _alterar_data_base_modal(
+            page, _venc_correto.day, _venc_correto.month, _venc_correto.year,
+            campo="base_pendencia",
+        )
+        if _dt_base is not None:
+            break
+        page.wait_for_timeout(400)
+    if _dt_base is not None:
+        resultado["base_pendencia_dt"] = _dt_base
+    page.wait_for_timeout(300)
 
     # --- Detecta "Nenhuma parcela disponivel para pagamento na data selecionada" ---
     # Faz polling direto no <p> alvo — sem esperar "Atualizando valores..." sumir.
@@ -1712,6 +1775,15 @@ def selecionar_parcelas_no_modal(
             pass
 
         chave = (grupo_card, cota_card) if grupo_card else None
+
+        # GUARD: cota ja BAIXADA num boleto anterior reapareceu no modal de
+        # unificacao. NAO seleciona parcela nenhuma dela (evita dupla emissao).
+        # Devolve a chave para o worker registrar a FALHA especifica.
+        if chave and chave in cotas_bloqueadas:
+            resultado["cotas_bloqueadas_baixadas"].append(chave)
+            if chave not in _cotas_excluidas_sweep:
+                _cotas_excluidas_sweep.add(chave)  # tambem exclui da varredura global
+            continue
 
         expandiu = _expandir_card_modal(page, card)
         if not expandiu:
