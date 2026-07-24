@@ -116,6 +116,7 @@ from processamento.lib.arquivos import (
     destino_sem_colisao,
     pasta_falha_cota,
     pasta_nao_baixado_cota,
+    pasta_atrasados_nao_emitidos_cota,
     pasta_boletos,
     pasta_adiantado_cota,
     pasta_verificar_adiantados,
@@ -142,6 +143,113 @@ def _emitir_json(payload: dict) -> None:
 
 def _stderr(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+def _debug_modo() -> str:
+    """
+    Modo debug definido pelo orquestrador via env RPA_DEBUG:
+      '1' = debug COMPLETO      (confirma cada boleto e cada violacao)
+      '2' = debug SO UNIFICADO  (confirma so antes de boleto unificado)
+      ''  = normal (sem debug)
+    """
+    return os.environ.get("RPA_DEBUG", "")
+
+
+def _debug_ativo() -> bool:
+    """True em QUALQUER modo debug (completo ou so-unificado)."""
+    return _debug_modo() in ("1", "2")
+
+
+def _debug_completo() -> bool:
+    """True so no debug COMPLETO."""
+    return _debug_modo() == "1"
+
+
+def _debug_so_unificado() -> bool:
+    """True so no debug SO UNIFICADO."""
+    return _debug_modo() == "2"
+
+
+def _debug_confirmar_download(nome_pdf: str, nome_cliente: str, selecionadas) -> bool:
+    """
+    MODO DEBUG: mostra o nome do arquivo que SERA gerado e pergunta se pode
+    baixar. Retorna True para prosseguir com o download, False para pular.
+
+    - Debug COMPLETO (RPA_DEBUG=1): pergunta em TODOS os boletos.
+    - Debug SO UNIFICADO (RPA_DEBUG=2): pergunta APENAS quando o boleto une
+      2+ cotas (unificado); boleto de cota unica baixa direto, sem perguntar.
+
+    Prompt vai em stderr (visivel ao vivo no console do orquestrador) e le
+    do stdin (console herdado). Fora do modo debug, retorna sempre True —
+    nao altera em nada o fluxo normal.
+    """
+    if not _debug_ativo():
+        return True
+
+    try:
+        eh_unificado = len(selecionadas) > 1
+    except Exception:
+        eh_unificado = False
+
+    # No modo SO UNIFICADO, boleto de cota unica nao pede confirmacao.
+    if _debug_so_unificado() and not eh_unificado:
+        return True
+
+    try:
+        cotas_txt = ", ".join(f"{s['grupo']}/{s['cota']}" for s in selecionadas)
+    except Exception:
+        cotas_txt = "?"
+    _tipo = f"UNIFICADO ({len(selecionadas)} cotas)" if eh_unificado else "cota unica"
+    _stderr("")
+    _stderr("+" + "=" * 58 + "+")
+    _stderr("|  MODO DEBUG  —  confirmacao antes de BAIXAR o boleto")
+    _stderr(f"|  Tipo    : {_tipo}")
+    _stderr(f"|  Cliente : {nome_cliente}")
+    _stderr(f"|  Cota(s) : {cotas_txt}")
+    _stderr(f"|  Arquivo : {nome_pdf}")
+    _stderr("|  [ 1 ] Baixar    |    [ outro ] Pular esta cota")
+    _stderr("+" + "=" * 58 + "+")
+    try:
+        # IMPORTANTE: o prompt vai para STDERR, nao para o input().
+        # input("...") escreveria o texto no STDOUT (sem \n) e grudaria no
+        # JSON final do worker, quebrando o parse do orquestrador
+        # (_extrair_json_da_saida) -> FALHA falsa. Por isso: prompt no stderr
+        # e input() sem argumento (le apenas do stdin).
+        _stderr("  Pode baixar? [1=sim] ")
+        resp = input().strip()
+    except Exception:
+        # Sem console interativo: nao trava o fluxo, segue baixando.
+        return True
+    return resp == "1"
+
+
+def _debug_confirmar_prosseguir(motivo: str) -> bool:
+    """
+    MODO DEBUG: uma FALHA/violacao aconteceu (ex: vencimento incorreto, parcela
+    com dia errado). No modo debug NAO ha reselecao — o fluxo TRAVA aqui, mostra
+    a observacao especifica e pergunta se deseja prosseguir mesmo assim.
+
+    Retorna True (prosseguir) ou False (abortar com FALHA).
+    So no debug COMPLETO (RPA_DEBUG=1). No modo SO UNIFICADO e no modo normal
+    retorna False (nunca prossegue sozinho num erro — vira FALHA).
+    Prompt em stderr (visivel ao vivo) e leitura do stdin (console herdado).
+    """
+    if not _debug_completo():
+        return False
+    _stderr("")
+    _stderr("+" + "=" * 58 + "+")
+    _stderr("|  MODO DEBUG — FALHA (sem reselecao de parcelas)")
+    _stderr(f"|  Motivo: {motivo}")
+    _stderr("|  [ 1 ] Prosseguir mesmo assim    |    [ outro ] Abortar (FALHA)")
+    _stderr("+" + "=" * 58 + "+")
+    try:
+        # Prompt no STDERR + input() sem argumento (ver nota em
+        # _debug_confirmar_download): evita contaminar o STDOUT/JSON.
+        _stderr("  Deseja prosseguir? [1=sim] ")
+        resp = input().strip()
+    except Exception:
+        return False
+    return resp == "1"
 
 
 def _payload(
@@ -474,6 +582,11 @@ def _carregar_contexto(id_cota: int) -> Dict[str, Any]:
     ctx["caminho_base"] = dados_lote.get("caminho_base")
     ctx["modalidade"] = dados_lote.get("modalidade")
     ctx["mes_ref"] = dados_lote.get("mes_ref")  # YYYYMM, ex: 202507
+
+    # Flag do ADM: se FALSE, nao emite parcela em atraso (so mes ref); cota
+    # so-atraso vira NAO_BAIXADO. Default True (comportamento normal).
+    from shared.sql_funcoes import obter_selecionar_atraso_por_fila
+    ctx["selecionar_atraso"] = obter_selecionar_atraso_por_fila(ctx["id_fila_adm"])
     return ctx
 
 
@@ -1648,6 +1761,22 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
         _snapshot_dl = avapro.snapshot_pdfs_downloads()
         _snapshot_time = time.time()
 
+        # BLINDAGEM (fix cota de imovel): o AVAPRO pode vir com "Selecionar
+        # todas as cotas" ATIVO, deixando a cota de imovel (outra modalidade)
+        # marcada junto — o modal entao abre com "2 cotas selecionadas para
+        # emissao". Aqui garantimos que APENAS a(s) cota(s) alvo fique(m)
+        # marcada(s) ANTES de clicar "Emitir boleto".
+        try:
+            _cotas_alvo_emit = {(s["grupo"], s["cota"]) for s in selecionadas}
+            if _cotas_alvo_emit:
+                avapro.garantir_apenas_cotas_marcadas(
+                    page, _cotas_alvo_emit,
+                    log_fn=lambda acao, detalhe="": _log(caminho_log, id_cota, acao, detalhe),
+                )
+        except Exception as _e_blind:
+            _log_err(caminho_log, id_cota,
+                     "Falha na blindagem de selecao (1a emissao)", str(_e_blind))
+
         # --- Clica "Emitir boleto" (botao primario do card) ---
         _registrar_passo(id_cota, "clicando em 'Emitir boleto'")
         avapro.clicar_baixar_documentos_emitir_boleto(
@@ -1662,12 +1791,13 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
         )
 
         # --- Modal de selecao de parcelas ---
-        # Aguarda ate 2 minutos por tentativa. Em falha, volta para Meus
-        # Clientes, re-pesquisa o cliente e re-clica Emitir boleto (sem
-        # re-login — leve, nao sobrecarrega o sistema). Maximo 2 tentativas.
-        # Se _cliente_pagina_ok, nao faz retry: o h2 ja confirmou a pagina;
-        # timeout no modal = erro mapeado → NAO_BAIXADO direto.
-        MAX_TENT_MODAL = 1 if _cliente_pagina_ok else 2
+        # Aguarda ate 90s (1:30) por tentativa que o modal apareca — o AVAPRO
+        # as vezes abre o modal com atraso. Em falha, volta para Meus Clientes,
+        # re-pesquisa o cliente e re-clica Emitir boleto (sem re-login — leve).
+        # SEMPRE 2 tentativas (mesmo com _cliente_pagina_ok): o modal que nao
+        # abre e problema de lentidao/servidor, nunca "sem cobrancas" — por isso
+        # retenta e, se esgotar, vira FALHA retriable (nao NAO_BAIXADO).
+        MAX_TENT_MODAL = 2
         _modal_result  = None
         _ultimo_pp_modal: Optional[str] = None
 
@@ -1771,6 +1901,7 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
                 page, _data_ref_do_lote(ctx),
                 modalidade=ctx.get("modalidade", "IMOVEL"),
                 cotas_bloqueadas=set(cotas_baixadas_bloqueadas.keys()),
+                selecionar_atraso=ctx.get("selecionar_atraso", True),
             )
             _log_tempo(caminho_log, id_cota, "modal_parcelas_concluido", t0)
 
@@ -1796,7 +1927,28 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
                      f"Falha no modal de parcelas (t{_tent_modal})",
                      f"{_modal_result['erro']} | print={_ultimo_pp_modal or '-'}")
             if _tent_modal >= MAX_TENT_MODAL:
-                # Pagina carregou mas modal nao abre → erro mapeado → NAO_BAIXADO
+                # TIMEOUT puro do modal (nao apareceu em 90s) = FALHA retriable.
+                # O AVAPRO as vezes abre o modal com atraso; ja aconteceu de ele
+                # carregar logo APOS ter sido marcado como NAO_BAIXADO. Entao
+                # timeout NUNCA vira NAO_BAIXADO — vira FALHA e e retentado no
+                # proximo ciclo do orquestrador.
+                if _modal_result.get("modal_timeout"):
+                    _pp_to = _print_falha(page, pasta_falha,
+                                          f"Modal_Timeout_T{_tent_modal}")
+                    _obs_to = (
+                        f"Modal de parcelas não apareceu (timeout de 90s) para "
+                        f"{_h2_nome_pagina or nome_cliente} após {MAX_TENT_MODAL} "
+                        f"tentativas — será retentado."
+                    )
+                    _log_err(caminho_log, id_cota, "FALHA (timeout do modal)", _obs_to)
+                    return _payload(
+                        "FALHA", _obs_to,
+                        id_cota=id_cota, retriable=True,
+                        caminho_evidencia_falha=_pp_to or _ultimo_pp_modal,
+                        cotas_nao_selecionadas=_nao_selecionadas_info,
+                    )
+                # Pagina carregou e houve DIALOG de erro do servidor (nao timeout)
+                # → erro mapeado → NAO_BAIXADO
                 if _cliente_pagina_ok:
                     _pp_nb = _print_falha(page, pasta_nao_baixado,
                                           f"Modal_Parcelas_Falhou_T{_tent_modal}")
@@ -1901,11 +2053,84 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
                 f"grupo={g_ad} cota={c_ad} obs={obs_ad!r} print={_pp_ad or '-'}",
             )
 
-        # Remove cotas adiantadas do modal da lista de selecionadas a emitir
+        # --- Trata cotas SO-ATRASO nao emitidas (ADM com selecionar_atraso=FALSE) ---
+        # Cota que so tinha parcela(s) em atraso (sem mes ref) -> NAO_BAIXADO,
+        # print numa pasta separada. As finalizacoes entram no mesmo balde
+        # (fins_adiantados_modal) para serem gravadas junto no banco.
+        _atraso_nao_emitido_set = set()
+        _atraso_ids = set()
+        for (g_at, c_at) in _modal_result.get("atraso_nao_emitido", []):
+            _atraso_nao_emitido_set.add((g_at, c_at))
+            _s_at = next(
+                (s for s in selecionadas
+                 if s["grupo"] == g_at and s["cota"] == c_at),
+                None,
+            )
+            if not _s_at:
+                continue
+            _g6_at = re.sub(r"\D", "", str(g_at)).zfill(6)
+            _c4_at = re.sub(r"\D", "", str(c_at)).zfill(4)
+            try:
+                _pasta_at = pasta_atrasados_nao_emitidos_cota(
+                    caminho_base, nome_cliente, g_at, c_at
+                )
+                _pp_at = _print_falha(page, _pasta_at, "Atraso_Nao_Emitido")
+            except Exception:
+                _pp_at = _print_falha(
+                    page, pasta_nao_baixado,
+                    f"Atraso_Nao_Emitido_{_g6_at}_{_c4_at}",
+                )
+            _obs_at = (
+                f"Cota {_g6_at}/{_c4_at}: cliente configurado para NAO emitir "
+                f"boleto de atraso (selecionar_atraso=FALSE) e a cota possui "
+                f"parcela(s) em atraso — cota ignorada, boleto nao emitido."
+            )
+            fins_adiantados_modal.append(
+                _fin(_s_at["id_cota"], "NAO_BAIXADO", _obs_at,
+                     caminho_evidencia=_pp_at)
+            )
+            _atraso_ids.add(_s_at["id_cota"])
+            _log(
+                caminho_log, id_cota,
+                "Cota so-atraso nao emitida (selecionar_atraso=FALSE)",
+                f"grupo={g_at} cota={c_at} print={_pp_at or '-'}",
+            )
+
+        # Remove adiantadas E so-atraso da lista de selecionadas a emitir
         selecionadas_para_emitir = [
             s for s in selecionadas
             if (s["grupo"], s["cota"]) not in _adiantados_modal_set
+            and (s["grupo"], s["cota"]) not in _atraso_nao_emitido_set
         ]
+
+        # Se sobrou cota so-atraso mas AINDA ha cotas em dia para emitir,
+        # apenas segue: as so-atraso ja foram finalizadas como NAO_BAIXADO
+        # acima e o boleto unifica somente as em dia (mes ref).
+        # Se NAO sobrou nenhuma cota em dia E a PRIMARIA e so-atraso -> retorna
+        # NAO_BAIXADO agora (nada a emitir).
+        if not selecionadas_para_emitir and id_cota in _atraso_ids:
+            _fin_prim_at = next(
+                (f for f in fins_adiantados_modal if f["id_cota"] == id_cota), None
+            )
+            _obs_prim_at = (
+                _fin_prim_at["observacao"] if _fin_prim_at
+                else "Cota possui parcela(s) em atraso — cota ignorada, boleto nao emitido."
+            )
+            _pp_prim_at = _fin_prim_at.get("caminho_evidencia") if _fin_prim_at else None
+            _log(
+                caminho_log, id_cota,
+                "Todas as cotas so-atraso — sem emissao (selecionar_atraso=FALSE)",
+                f"qtd_nao_emitidas={len(_atraso_ids)}",
+            )
+            return _payload(
+                "NAO_BAIXADO", _obs_prim_at, id_cota=id_cota,
+                retriable=False,
+                caminho_evidencia_falha=_pp_prim_at,
+                houve_unificacao=False,
+                cotas_distintas=[[s["grupo"], s["cota"]] for s in selecionadas],
+                finalizacoes=fins_adiantados_modal,
+                cotas_nao_selecionadas=_nao_selecionadas_info,
+            )
 
         # Se TODAS as cotas sao adiantadas (modal) → retorna sem precisar de
         # Continuar ou PDF
@@ -1986,6 +2211,51 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
                 finalizacoes=_fins_footer,
                 cotas_nao_selecionadas=_nao_selecionadas_info,
             )
+
+        # --- REDE DE SEGURANCA: desmarca parcelas de dia errado que o AVAPRO
+        # auto-selecionou (ex: parcelas de imovel dia >=15 num lote MOTORS). ---
+        try:
+            _qtd_desm = avapro.desmarcar_parcelas_dia_errado(
+                page, ctx.get("modalidade", "IMOVEL")
+            )
+            if _qtd_desm:
+                _log(caminho_log, id_cota,
+                     "Parcelas de dia errado DESMARCADAS (auto-selecao AVAPRO)",
+                     f"qtd={_qtd_desm} modalidade={ctx.get('modalidade')}")
+        except Exception as _e_desm:
+            _log_err(caminho_log, id_cota,
+                     "Falha ao desmarcar parcelas de dia errado", str(_e_desm))
+
+        # --- SEGURANCA: confere o DIA de vencimento de cada parcela MARCADA ---
+        # MOTORS -> dia < 15 | IMOVEL -> dia >= 15. Se alguma parcela marcada
+        # estiver com o dia incompativel (ex: parcela de imovel dia 15 marcada
+        # num lote MOTORS), NAO gera o boleto. No modo debug pergunta se deseja
+        # prosseguir; fora do debug e sempre FALHA (questao de seguranca).
+        _violacoes_dia = avapro.verificar_dias_parcelas_selecionadas(
+            page, ctx.get("modalidade", "IMOVEL")
+        )
+        if _violacoes_dia:
+            _det_viol = "; ".join(
+                f"parcela {v['numero']} venc {v['vencimento']} (dia {v['dia']})"
+                for v in _violacoes_dia
+            )
+            _obs_seg = (
+                f"SEGURANCA: {len(_violacoes_dia)} parcela(s) marcada(s) com dia "
+                f"de vencimento incompativel com a modalidade "
+                f"{ctx.get('modalidade','?')}: {_det_viol}"
+            )
+            _log_err(caminho_log, id_cota,
+                     "Violacao de dia de vencimento nas parcelas", _obs_seg)
+            _stderr(f"[WORKER] {_obs_seg}")
+            _pp_seg = _print_falha(page, pasta_falha, "Seguranca_Dia_Venc_Incorreto")
+            # Debug: trava e pergunta. Nao-debug: FALHA direto (seguranca).
+            if not _debug_confirmar_prosseguir(_obs_seg):
+                return _payload(
+                    "FALHA", _obs_seg,
+                    id_cota=id_cota, retriable=False,
+                    caminho_evidencia_falha=_pp_seg,
+                    cotas_nao_selecionadas=_nao_selecionadas_info,
+                )
 
         # --- Clica "Continuar" no modal → tela de resumo → "Baixar" → download ---
         try:
@@ -2166,6 +2436,40 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
                     f"Modal Pagamento OK (tentativa {_tent_venc})",
                     f"vencimento={_venc_modal_str!r} valor={_valor_pagar_str!r}",
                 )
+
+                # ---- MODO DEBUG: confirma antes de baixar ----
+                # Calcula o nome do arquivo que SERIA gerado (mesma logica do
+                # pos-loop) e pede confirmacao. Se o operador recusar, fecha o
+                # modal e pula a cota como NAO_BAIXADO (sem baixar nada).
+                if _debug_ativo():
+                    _unif_prev = len(selecionadas_para_emitir) > 1
+                    _meses_prev = _modal_result.get("meses_parcelas") or []
+                    if _unif_prev:
+                        _nome_pdf_prev = nome_arquivo_boleto_unificado(nome_cliente)
+                    else:
+                        _s0p = selecionadas_para_emitir[0]
+                        _nome_pdf_prev = nome_arquivo_boleto(
+                            _s0p["grupo"], _s0p["cota"], nome_cliente, _meses_prev
+                        )
+                    if not _debug_confirmar_download(
+                        _nome_pdf_prev, nome_cliente, selecionadas_para_emitir
+                    ):
+                        _log(caminho_log, id_cota,
+                             "MODO DEBUG: operador optou por NAO baixar",
+                             f"arquivo={_nome_pdf_prev}")
+                        try:
+                            avapro.fechar_modal_pagamento(page)
+                        except Exception:
+                            pass
+                        return _payload(
+                            "NAO_BAIXADO",
+                            f"Modo debug: operador optou por nao baixar "
+                            f"({_nome_pdf_prev}).",
+                            id_cota=id_cota,
+                            retriable=False,
+                            cotas_nao_selecionadas=_nao_selecionadas_info,
+                        )
+
                 try:
                     _t_antes_baixar = time.time()
                     clicou_baixar = avapro.aguardar_e_clicar_baixar_resumo(page, timeout_ms=10000)
@@ -2212,6 +2516,26 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
             _log(caminho_log, id_cota, "Evidencia vencimento incorreto",
                  f"print={_pp_venc_inc or '-'}")
 
+            # MODO DEBUG COMPLETO: trava aqui e pergunta se prossegue mesmo
+            # com o vencimento diferente. No modo SO UNIFICADO e no normal NAO
+            # pergunta — cai no fluxo normal de re-emissao (MAX_TENT_VENC).
+            if _debug_completo():
+                if _debug_confirmar_prosseguir(_obs_venc_inc):
+                    try:
+                        avapro.aguardar_e_clicar_baixar_resumo(page, timeout_ms=10000)
+                        _log(caminho_log, id_cota,
+                             "MODO DEBUG: prosseguindo apesar do vencimento diferente", "")
+                    except Exception as _e_bxd:
+                        _log_err(caminho_log, id_cota,
+                                 "Falha ao clicar Baixar (debug prosseguir)", str(_e_bxd))
+                    break  # sai do loop de vencimento -> segue para download
+                return _payload(
+                    "FALHA", _obs_venc_inc,
+                    id_cota=id_cota, retriable=False,
+                    caminho_evidencia_falha=_pp_venc_inc,
+                    cotas_nao_selecionadas=_nao_selecionadas_info,
+                )
+
             if _tent_venc >= MAX_TENT_VENC:
                 # Esgotou tentativas — FALHA
                 return _payload(
@@ -2229,6 +2553,23 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
             avapro.fechar_modal_pagamento(page)
             page.wait_for_timeout(2000)
 
+            # BLINDAGEM (fix cota de imovel na re-emissao): ao voltar do modal de
+            # pagamento, o AVAPRO re-marca cotas que NAO sao a alvo (ex: a cota de
+            # imovel de outra modalidade). Garante que APENAS a(s) cota(s) alvo
+            # fique(m) marcada(s) antes de re-clicar "Emitir boleto".
+            try:
+                _cotas_alvo_reemit = {
+                    (s["grupo"], s["cota"]) for s in selecionadas_para_emitir
+                }
+                avapro.garantir_apenas_cotas_marcadas(
+                    page, _cotas_alvo_reemit,
+                    log_fn=lambda acao, detalhe="": _log(caminho_log, id_cota, acao, detalhe),
+                )
+            except Exception as _e_resel:
+                _log_err(caminho_log, id_cota,
+                         f"Falha na blindagem de re-selecao (t{_tent_venc})",
+                         str(_e_resel))
+
             # Re-clica Emitir boleto
             try:
                 avapro.clicar_baixar_documentos_emitir_boleto(
@@ -2244,6 +2585,7 @@ def _processar_cota(ctx: Dict[str, Any]) -> dict:
                 _modal_result2 = avapro.selecionar_parcelas_no_modal(
                     page, _data_ref_do_lote(ctx),
                     modalidade=ctx.get("modalidade", "IMOVEL"),
+                    selecionar_atraso=ctx.get("selecionar_atraso", True),
                 )
                 # Atualiza vencimento esperado se o novo modal recalculou
                 _venc2 = _modal_result2.get("vencimento_esperado_dt")

@@ -38,6 +38,7 @@ import sys
 import json
 import time
 import random
+import tempfile
 import subprocess
 import traceback
 from pathlib import Path
@@ -409,6 +410,15 @@ def _detectar_mensagem_erro_login(page) -> Optional[str]:
         "Usuario ou senha invalida",
         "usuário ou senha inválida",
         "usuario ou senha invalida",
+        # Sessao/senha expirada (variacoes com/sem acento)
+        "expirou",
+        "expirada",
+        "expirado",
+        "sessão expirada",
+        "sessao expirada",
+        "senha expirada",
+        "sua sessão expirou",
+        "sua sessao expirou",
     ]
 
     for texto in candidatos:
@@ -420,6 +430,24 @@ def _detectar_mensagem_erro_login(page) -> Optional[str]:
                     return real or texto
                 except Exception:
                     return texto
+        except Exception:
+            continue
+
+    # Fallback generico: qualquer <p> de erro vermelho que o AVAPRO exibe
+    # inline (class text-red-600). Captura o texto que estiver la, seja qual
+    # for a frase — assim erros mapeados nao caem no caminho de timeout.
+    seletores_erro = [
+        "p.text-red-600",
+        ".text-red-600",
+        "[class*='text-red']",
+    ]
+    for sel in seletores_erro:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                real = (loc.first.inner_text() or "").strip()
+                if real:
+                    return real
         except Exception:
             continue
 
@@ -471,6 +499,16 @@ def _esperar_resultado_login(
             raise LoginGraveError(msg_erro, caminho_print)
 
         page_alvo.wait_for_timeout(300)
+
+    # Checagem final: antes de declarar timeout, faz uma ultima varredura pela
+    # tag de erro vermelha. Se ela existir, e um erro MAPEADO (credencial/sessao
+    # expirada) e nao um timeout de verdade — captura e trata como falha mapeada.
+    msg_erro_final = _detectar_mensagem_erro_login(page_alvo)
+    if msg_erro_final:
+        caminho_print = _capturar_print(
+            page_alvo, caminho_base, "LOGIN_CREDENCIAIS_INVALIDAS"
+        )
+        raise LoginGraveError(msg_erro_final, caminho_print)
 
     caminho_print = _capturar_print(page_alvo, caminho_base, "LOGIN_TIMEOUT")
     raise LoginGraveError(
@@ -652,7 +690,9 @@ def _executar_login(id_fila_adm: int) -> str:
     # IMPORTANTE: Edge/Chromium recentes BLOQUEIAM --remote-debugging-port
     # no perfil padrao do usuario (mudanca de seguranca do Chromium ~2025).
     # Perfil dedicado via --user-data-dir e obrigatorio para o CDP subir.
-    user_data_dir = os.path.join(ROOT_DIR, "credenciais", "edge_cdp_profile")
+    # Perfil fica no %TEMP% (igual ao rpa_ofertar_lance) para nao inflar a
+    # pasta do projeto — o Edge regenera cache/perfil sozinho quando preciso.
+    user_data_dir = os.path.join(tempfile.gettempdir(), "edge_cdp_rpa_boleto")
     os.makedirs(user_data_dir, exist_ok=True)
     subprocess.Popen(
         [
@@ -810,6 +850,7 @@ def main() -> int:
                 "usuario ou senha invalida", "usuario ou senha inválida",
                 "usuário ou senha inválida", "usuário ou senha invalida",
                 "invalida", "inválida",
+                "expirou", "expirada", "expirado",
             )
         )
 

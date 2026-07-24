@@ -100,6 +100,35 @@ def atualizar_data_vencimento_fila_adm(id_fila_adm: int, data_vencimento) -> Non
         conn.commit()
 
 
+def obter_selecionar_atraso_por_fila(id_fila_adm: int) -> bool:
+    """
+    Le a flag `selecionar_atraso` do ADM dono do lote (via tbl_fila_adm).
+      True  (default) = comportamento normal (emite atraso + mes ref).
+      False           = so emite a parcela do mes ref; cota so-atraso vira
+                        NAO_BAIXADO.
+    Em QUALQUER erro (ex: coluna ainda nao criada), retorna True para nao
+    bloquear a emissao (backward compatible).
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(a.selecionar_atraso, TRUE)
+                    FROM tbl_fila_adm fa
+                    JOIN tbl_adm a ON a.id_adm = fa.id_adm
+                    WHERE fa.id_fila_adm = %s
+                    """,
+                    (id_fila_adm,),
+                )
+                row = cur.fetchone()
+        if not row or row[0] is None:
+            return True
+        return bool(row[0])
+    except Exception:
+        return True
+
+
 def obter_dados_adm_por_fila(id_fila_adm: int) -> Optional[Dict[str, Any]]:
     """
     Retorna os dados consolidados do lote + ADM, ja resolvendo

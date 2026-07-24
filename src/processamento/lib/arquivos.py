@@ -264,6 +264,26 @@ def pasta_nao_baixado_cota(
     return pasta_nao_baixados_root(caminho_base) / nome_pasta
 
 
+def pasta_atrasados_nao_emitidos_cota(
+    caminho_base: Optional[str],
+    nome_cliente: str,
+    grupo,
+    cota,
+) -> Path:
+    """
+    Cotas de ADMs com selecionar_atraso=FALSE que so tinham parcela(s) em
+    atraso (sem parcela do mes ref) e por isso NAO tiveram boleto emitido:
+        {caminho_base}/Evidencias/NAO_BAIXADOS/Atrasados nao emitidos/{Nome}_{g}_{c}/
+
+    Subpasta dedicada dentro de NAO_BAIXADOS para separar esses casos dos
+    demais NAO_BAIXADOS (modalidade errada, valor zero, etc.).
+    NAO cria a pasta — criacao preguicosa no momento do save da evidencia.
+    """
+    sufixo = _slug_grupo_cota(grupo, cota)
+    nome_pasta = f"{nome_cliente_para_arquivo(nome_cliente)[:40].rstrip()}_{sufixo}"
+    return pasta_nao_baixados_root(caminho_base) / "Atrasados nao emitidos" / nome_pasta
+
+
 def pasta_boletos(
     caminho_base: str,
     nome_consultor: Optional[str] = None,

@@ -737,6 +737,14 @@ Todos os wrappers do banco. Funções de processamento usadas pelo worker:
 
 **Solução:** `aguardar_resultado_pesquisa()` exige que o sinal (UM/ZERO/MUITOS) seja **estável por 3 ciclos consecutivos** de 200ms (~600ms de estabilidade) antes de decidir.
 
+### 9. Parcela do mês ref "Futura" (disabled) não era emitida → cota virava ADIANTADO
+
+**Causa:** Quando o mês ref é uma parcela ainda **não vencida** (ex.: rodando em julho com `mes_ref=agosto`), o AVAPRO exibe a parcela do mês ref como **"Futura" com o checkbox `disabled`**. O fix #3 (pula checkbox disabled) fazia o robô ignorá-la; sem parcela do mês ref selecionável e às vezes sem atraso, a cota caía em `cota_selecionadas_count == 0` e era marcada como **ADIANTADO** por engano. Mapeado direto no AVAPRO em 24/07/2026: **esperar NÃO habilita** o checkbox (testado ~9s sem efeito).
+
+**Solução:** `_card_tem_mes_ref_disabled()` detecta a parcela do mês ref com checkbox disabled; nesse caso `_clicar_selecionar_todas_parcelas_card()` clica no master **"Selecionar todas as parcelas" do card** (escopo estrito no card, nunca page-level — protege o modo unificado). Esse clique marca as parcelas em atraso **e remove o `disabled`** da parcela do mês ref (deixando-a desmarcada). Depois o card é re-lido e o loop normal marca a parcela do mês ref individualmente. Só dispara quando há parcela do mês ref disabled — cotas normais não são afetadas (não regride #3/#4).
+
+**Pré-requisito:** depende de "Base pendência" e "Venc. boleto" já estarem no dia do mês ref (o robô já faz isso via `calcular_vencimento`); é a Base pendência ≥ vencimento da parcela que permite o master habilitá-la.
+
 ---
 
 *Documentação gerada em 2026-06-01. Atualizar sempre que houver mudanças no fluxo do AVAPRO ou nas regras de negócio.*

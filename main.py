@@ -169,6 +169,11 @@ TIMEOUT_LOGIN_S = 180
 TIMEOUT_WORKER_S = 600  # antes 180s: curto p/ clientes com muitas cotas (unificacao)
 TIMEOUT_SAIDA_S = 600
 
+# Modo debug: quando True, o worker PARA antes de baixar cada boleto, mostra o
+# nome do arquivo e pede confirmacao. Ativado interativamente no inicio do main.
+# 0 = normal, 1 = debug completo, 2 = debug so unificado.
+MODO_DEBUG = 0
+
 
 # ============================================================
 # Subprocess utils
@@ -180,6 +185,40 @@ def _imprimir(secao, msg):
 
 def _imprimir_err(secao, msg):
     print(f"[{secao}] ERRO: {msg}", file=sys.stderr, flush=True)
+
+
+def _debug_confirmar_proxima(status_final, vai_retentar, nome_cliente,
+                             grupo, cota, tentativa) -> bool:
+    """
+    MODO DEBUG: apos uma cota terminar em NAO_BAIXADO / ADIANTADO / FALHA,
+    pausa e pergunta se deve prosseguir.
+
+    - Se a cota vai retentar (FALHA retriable com tentativas restantes),
+      pergunta se vai para a proxima TENTATIVA.
+    - Caso contrario, pergunta se prossegue para a proxima COTA.
+
+    Retorna True (prosseguir) ou False (parar o lote — vira PAUSADO).
+    Este prompt roda no orquestrador (stdout = terminal real), entao pode
+    usar print()/input() sem risco de contaminar o JSON do worker.
+    """
+    if vai_retentar:
+        acao = f"proxima TENTATIVA ({tentativa + 1}/{MAX_TENTATIVAS_COTA})"
+    else:
+        acao = "proxima COTA"
+    print("", flush=True)
+    print("+" + "=" * 58 + "+", flush=True)
+    print(f"|  MODO DEBUG  —  cota finalizada como: {status_final}", flush=True)
+    print(f"|  Cliente : {nome_cliente}", flush=True)
+    print(f"|  Cota    : {grupo}/{cota}", flush=True)
+    print(f"|  [ 1 ] Ir para {acao}", flush=True)
+    print(f"|  [ outro ] Parar aqui (lote fica PAUSADO)", flush=True)
+    print("+" + "=" * 58 + "+", flush=True)
+    try:
+        resp = input("  Prosseguir? [1=sim] ").strip()
+    except Exception:
+        # Sem console interativo: nao trava o fluxo, prossegue.
+        return True
+    return resp == "1"
 
 
 def _resumo_payload(secao: str, payload: dict) -> None:
@@ -536,7 +575,10 @@ def _processar_cota_uma_vez(
     try:
         payload = _rodar_script(
             secao="WORKER", script_path=PROCESSAMENTO_MAIN,
-            argv_extras=[id_cota], timeout_s=TIMEOUT_WORKER_S,
+            argv_extras=[id_cota],
+            # No modo debug o worker fica parado esperando a confirmacao do
+            # operador — sem timeout para nao ser morto durante a espera.
+            timeout_s=None if MODO_DEBUG else TIMEOUT_WORKER_S,
         )
         status = (payload.get("status") or "FALHA").upper()
         retriable = bool(payload.get("retriable", False))
@@ -627,7 +669,8 @@ def _processar_cota_uma_vez(
             from shared.sql_funcoes import atualizar_cota_para_retry
             atualizar_cota_para_retry(id_cota, tentativa + 1)
             _imprimir("MAIN",
-                      f"  ↺ retry — id_cota={id_cota} voltou para PENDENTE "
+                      f"  ↺ retry — grupo={grupo} cota={cota} (id_cota={id_cota}) "
+                      f"voltou para PENDENTE "
                       f"(tentativa {tentativa + 1}/{MAX_TENTATIVAS_COTA})")
         except Exception as e:
             _imprimir_err("MAIN",
@@ -647,8 +690,8 @@ def _processar_cota_uma_vez(
 
     obs_final = f"FALHA [{tentativa}/{MAX_TENTATIVAS_COTA}] — {obs}"
     _imprimir_err("MAIN",
-                  f"Cota {id_cota} esgotou {MAX_TENTATIVAS_COTA} tentativas. "
-                  f"obs={obs_final!r}")
+                  f"Cota grupo={grupo} cota={cota} (id_cota={id_cota}) esgotou "
+                  f"{MAX_TENTATIVAS_COTA} tentativas. obs={obs_final!r}")
 
     if retriable:
         # Worker nao gravou — finalizamos com a mensagem final.
@@ -697,6 +740,38 @@ def main():
         return 2
 
     _imprimir("MAIN", f"modalidade={modalidade}")
+
+    # --- Pergunta de MODO DEBUG (apos escolher a modalidade) ---
+    # Se stdin nao for interativo (ex: agendador), assume modo normal.
+    global MODO_DEBUG, _PARAR
+    # MODO_DEBUG: 0 = normal, 1 = debug completo, 2 = debug so unificado.
+    MODO_DEBUG = 0
+    try:
+        if sys.stdin and sys.stdin.isatty():
+            print("", flush=True)
+            print("Modo de execucao:", flush=True)
+            print("  [ 1 ] Debug COMPLETO  — para antes de cada boleto e pede confirmacao", flush=True)
+            print("  [ 2 ] Debug SO UNIFICADO — para so antes de boleto unificado (2+ cotas)", flush=True)
+            print("  [ outro ] Normal (sem paradas)", flush=True)
+            _resp_dbg = input("  Escolha: ").strip()
+            if _resp_dbg == "1":
+                MODO_DEBUG = 1
+            elif _resp_dbg == "2":
+                MODO_DEBUG = 2
+            else:
+                MODO_DEBUG = 0
+    except Exception:
+        MODO_DEBUG = 0
+
+    if MODO_DEBUG == 1:
+        os.environ["RPA_DEBUG"] = "1"
+        _imprimir("MAIN", "MODO DEBUG COMPLETO — confirmacao antes de cada boleto.")
+    elif MODO_DEBUG == 2:
+        os.environ["RPA_DEBUG"] = "2"
+        _imprimir("MAIN", "MODO DEBUG SO UNIFICADO — confirmacao so antes de boleto unificado.")
+    else:
+        os.environ.pop("RPA_DEBUG", None)
+        _imprimir("MAIN", "modo normal (sem debug)")
 
     # Importa sql_funcoes uma vez so, fora do loop.
     try:
@@ -1038,7 +1113,23 @@ def main():
             _icone_final = {"BAIXADO": "✓", "ADIANTADO": "~", "NAO_BAIXADO": "~"}.get(
                 status_final, "✗"
             )
-            _imprimir("MAIN", f"  {_icone_final} FINAL: {status_final}  (cota {id_cota})")
+            _imprimir("MAIN", f"  {_icone_final} FINAL: {status_final}  "
+                              f"(grupo={grupo} cota={cota} id_cota={id_cota})")
+
+            # MODO DEBUG COMPLETO: se a cota terminou em NAO_BAIXADO / ADIANTADO
+            # / FALHA, pausa e pergunta se prossegue (proxima cota) ou, se for
+            # FALHA retriable, se vai para a proxima tentativa. "Nao" para o
+            # lote. No modo SO UNIFICADO (2) e no normal, nao pergunta aqui.
+            if MODO_DEBUG == 1 and status_final != "BAIXADO":
+                _vai_retentar = (status_final == "FALHA" and retriable)
+                if not _debug_confirmar_proxima(
+                    status_final, _vai_retentar,
+                    nome_cliente, grupo, cota, tentativa,
+                ):
+                    _imprimir("MAIN",
+                              "  MODO DEBUG: parada solicitada pelo operador "
+                              "— encerrando (lote fica PAUSADO).")
+                    _PARAR = True
 
             # Se FALHA retriable, agenda re-login para a proxima iteracao.
             if status_final == "FALHA" and retriable:

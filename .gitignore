@@ -1,12 +1,18 @@
 # ============================================================
 # SEGURANCA — NUNCA VERSIONAR (credenciais e segredos)
 # ============================================================
+.env
+.env.*
 credentials/
 credenciais/
 token.json
 client_secret*.json
 *.pem
 *.key
+
+# SQL com credenciais em texto puro (senha de ADM) — NUNCA versionar.
+# Mantem as migrations de schema (sql/migrations/), ignora os INSERTs com senha.
+sql/insert_*.sql
 
 # Perfil do navegador Edge (CDP) — gerado automaticamente, pesado, contem sessao/login
 credenciais/edge_cdp_profile/
@@ -17,6 +23,14 @@ lotes/
 log/
 *.pdf
 *.png
+
+# Estado de runtime do worker (muda a cada execucao)
+.rpa_worker_passo.txt
+
+# Scripts auxiliares e ferramentas de debug (opcional — remova se quiser versionar)
+Scripts auxiliares/
+debug_processamento.py
+rodar_rpa_processamento_debug.bat
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

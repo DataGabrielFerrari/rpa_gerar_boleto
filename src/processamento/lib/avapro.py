@@ -864,6 +864,105 @@ def marcar_checkbox_cota(page, grupo: str, cota: str, log_fn=None) -> None:
     )
 
 
+def garantir_apenas_cotas_marcadas(page, cotas_alvo, log_fn=None) -> None:
+    """
+    Garante que APENAS as cotas em `cotas_alvo` fiquem marcadas na tela do
+    cliente, DESMARCANDO qualquer outra que esteja marcada.
+
+    Usado na RE-EMISSAO: ao fechar o modal de pagamento e voltar para a tela do
+    cliente, o AVAPRO re-marca cotas que NAO sao a alvo (inclusive de outra
+    modalidade — ex: imovel). Sem isto, o "Emitir boleto" re-clicado incluiria a
+    cota errada e o boleto sairia com a cota de imovel junto.
+
+    cotas_alvo: iterable de (grupo, cota). Comparacao por digitos, ignorando
+    zeros a esquerda e formatacao.
+    """
+    def _lg(acao: str, detalhe: str = "") -> None:
+        if log_fn:
+            try:
+                log_fn(acao, detalhe)
+            except Exception:
+                pass
+
+    def _norm(v) -> str:
+        d = _so_digitos(v)
+        return (d.lstrip("0") or "0")
+
+    alvo = {(_norm(g), _norm(c)) for (g, c) in cotas_alvo}
+
+    # Espera a lista de cotas do cliente estar visivel (senao a contagem pode
+    # vir 0 por timing e nao ajustaria nada).
+    try:
+        page.locator(
+            "button[role='checkbox'][aria-label^='Selecionar cota']"
+        ).first.wait_for(state="visible", timeout=8000)
+    except Exception:
+        pass
+
+    # PASSO 1 (raiz do problema): o AVAPRO abre a tela com "Selecionar todas as
+    # cotas" ATIVO, deixando TODAS as cotas marcadas (inclusive a de imovel).
+    # Desmarcamos esse "selecionar todas" primeiro — isso limpa a selecao de uma
+    # vez. Depois marcamos apenas a(s) cota(s) alvo.
+    try:
+        _todas = page.locator(
+            "button[role='checkbox'][aria-label='Selecionar todas as cotas']"
+        ).first
+        if _todas.count() > 0 and (_todas.get_attribute("data-state") or "").lower() == "checked":
+            _todas.click(timeout=3000)
+            page.wait_for_timeout(300)
+            _lg("[SELECAO] 'Selecionar todas as cotas' desmarcado (limpou tudo)", "")
+    except Exception as e:
+        _lg("[SELECAO] Falha ao desmarcar 'Selecionar todas as cotas'", str(e))
+
+    # PASSO 2: percorre os checkboxes das cotas e garante que APENAS as alvo
+    # fiquem marcadas (marca a alvo se estiver desmarcada; desmarca qualquer
+    # nao-alvo que ainda esteja marcada).
+    try:
+        checkboxes = page.locator(
+            "button[role='checkbox'][aria-label^='Selecionar cota']"
+        )
+        total = checkboxes.count()
+    except Exception as e:
+        _lg("[SELECAO] Nao consegui listar checkboxes das cotas", str(e))
+        return
+
+    _lg("[SELECAO] Ajustando selecao",
+        f"checkboxes_na_tela={total} cotas_alvo={sorted(alvo)}")
+
+    for i in range(total):
+        try:
+            cb = checkboxes.nth(i)
+            label = cb.get_attribute("aria-label") or ""
+            nums = re.findall(r"\d+", label)
+            if len(nums) < 2:
+                continue
+            g_norm = nums[-2].lstrip("0") or "0"
+            c_norm = nums[-1].lstrip("0") or "0"
+            marcado = (cb.get_attribute("data-state") or "").lower() == "checked"
+            deve_marcar = (g_norm, c_norm) in alvo
+
+            if deve_marcar and not marcado:
+                try:
+                    cb.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                cb.click(timeout=3000)
+                page.wait_for_timeout(200)
+                _lg("[SELECAO] Marcada cota ALVO", f"grupo={g_norm} cota={c_norm}")
+            elif (not deve_marcar) and marcado:
+                try:
+                    cb.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                cb.click(timeout=3000)
+                page.wait_for_timeout(200)
+                _lg("[SELECAO] DESMARCADA cota nao-alvo",
+                    f"grupo={g_norm} cota={c_norm}")
+        except Exception as e:
+            _lg("[SELECAO] Falha ao ajustar um checkbox", str(e))
+            continue
+
+
 def detectar_toast_sem_cobrancas(page, timeout_s: int = 3) -> Optional[str]:
     """
     Apos o clique em 'Emitir boleto', se a cota nao tem cobrancas
@@ -1271,6 +1370,120 @@ def _clicar_checkbox_parcela(page, checkbox_loc) -> bool:
         return False
 
 
+def _desmarcar_checkbox_parcela(page, checkbox_loc) -> bool:
+    """
+    DESMARCA o checkbox de uma parcela SE estiver marcado. Usado para remover
+    parcelas que o AVAPRO auto-selecionou ("Selecionar todas as parcelas") mas
+    que NAO devem entrar no boleto (dia de outra modalidade, parcela futura).
+
+    Retorna True se ficou desmarcado (ou ja estava). Nunca levanta excecao.
+    Nao mexe em checkbox desabilitado.
+    """
+    def _marcado():
+        try:
+            st = (checkbox_loc.get_attribute("data-state") or "").lower()
+            ar = (checkbox_loc.get_attribute("aria-checked") or "").lower()
+            return st == "checked" or ar == "true"
+        except Exception:
+            return False
+    try:
+        if checkbox_loc.get_attribute("disabled") is not None or \
+           checkbox_loc.get_attribute("data-disabled") is not None:
+            return not _marcado()
+        if not _marcado():
+            return True  # ja desmarcado
+        for _tent in range(3):
+            try:
+                if _tent == 0:
+                    checkbox_loc.dispatch_event("click")
+                elif _tent == 1:
+                    checkbox_loc.scroll_into_view_if_needed(timeout=2000)
+                    checkbox_loc.click(timeout=4000)
+                else:
+                    checkbox_loc.click(timeout=4000, force=True)
+            except Exception:
+                page.wait_for_timeout(300)
+                continue
+            page.wait_for_timeout(300)
+            if not _marcado():
+                return True
+            page.wait_for_timeout(400)
+        return False
+    except Exception:
+        return False
+
+
+def _clicar_selecionar_todas_parcelas_card(page, card_div) -> bool:
+    """
+    Clica no master "Selecionar todas as parcelas" DO CARD (NAO o
+    "Selecionar todas ate a data base de pendencia" do topo do modal).
+
+    Motivo (mapeado direto no AVAPRO em 24/07/2026): a parcela do MES REF
+    que ainda nao venceu vem como "Futura" com o checkbox `disabled`. Ela
+    PRECISA ser emitida (ex.: rodando em julho com mes_ref=agosto), mas o
+    Playwright nao clica em checkbox disabled (ver fix #3). Esperar NAO
+    habilita o checkbox — testado por ~9s sem efeito. O UNICO gatilho
+    confiavel e clicar neste master do card: ele marca as parcelas em
+    atraso E remove o `disabled` da parcela do mes ref (deixando-a
+    DESMARCADA, pronta para clique individual pelo loop normal).
+
+    Escopo estrito no card (e no pai como fallback) para nao clicar no
+    master de OUTRA cota no modal de unificacao. Nunca cai para page-level.
+
+    Retorna True se o master ja estava marcado ou foi clicado com sucesso.
+    """
+    _SEL = (
+        "button[role='checkbox'][aria-label='Selecionar todas as parcelas'], "
+        "button[role='checkbox'][aria-label*='todas as parcelas']"
+    )
+    escopos = [card_div]
+    try:
+        pai = card_div.locator("xpath=..").first
+        if pai.count() > 0:
+            escopos.append(pai)
+    except Exception:
+        pass
+    for escopo in escopos:
+        try:
+            loc = escopo.locator(_SEL).first
+            if loc.count() == 0 or not loc.is_visible():
+                continue
+            st = (loc.get_attribute("data-state") or "").lower()
+            ar = (loc.get_attribute("aria-checked") or "").lower()
+            if st == "checked" or ar == "true":
+                return True  # ja marcado — o efeito de habilitar ja ocorreu
+            # dispatch_event: nao rola a pagina (evita o scroll fantasma).
+            loc.dispatch_event("click")
+            page.wait_for_timeout(300)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _card_tem_mes_ref_disabled(parcelas, mes_ref: int, ano_ref: int) -> bool:
+    """
+    True se existe no card uma parcela do MES REF cujo checkbox esta
+    `disabled`/`data-disabled` (a parcela "Futura" que precisamos habilitar
+    via _clicar_selecionar_todas_parcelas_card antes de marca-la).
+    """
+    for p in parcelas:
+        vdt = p.get("vencimento_dt")
+        if vdt is None:
+            continue
+        if vdt.month == mes_ref and vdt.year == ano_ref:
+            cb = p.get("checkbox_loc")
+            try:
+                if cb is not None and (
+                    cb.get_attribute("disabled") is not None
+                    or cb.get_attribute("data-disabled") is not None
+                ):
+                    return True
+            except Exception:
+                continue
+    return False
+
+
 def detectar_e_fechar_erro_parcelas(page, timeout_ms: int = 3000) -> Optional[str]:
     """
     Detecta o dialog de erro 'Nao foi possivel carregar as parcelas para
@@ -1537,6 +1750,7 @@ def selecionar_parcelas_no_modal(
     data_ref: Optional[datetime] = None,
     modalidade: str = "IMOVEL",
     cotas_bloqueadas: Optional[set] = None,
+    selecionar_atraso: bool = True,
 ) -> Dict[str, Any]:
     """
     Trata o modal 'Selecione as parcelas para emissao do boleto'.
@@ -1582,6 +1796,7 @@ def selecionar_parcelas_no_modal(
     resultado: Dict[str, Any] = {
         "por_cota": {},
         "adiantados_modal": [],
+        "atraso_nao_emitido": [],  # cotas so-atraso nao emitidas (selecionar_atraso=False)
         "cotas_bloqueadas_baixadas": [],  # cotas ja BAIXADAS reexibidas no modal
         "total_selecionadas": 0,
         "pode_continuar": False,
@@ -1595,7 +1810,7 @@ def selecionar_parcelas_no_modal(
     try:
         page.locator(
             "h2:text-matches('Selecione as parcelas', 'i')"
-        ).first.wait_for(state="visible", timeout=30000)  # 30 segundos
+        ).first.wait_for(state="visible", timeout=90000)  # 90s (1:30) — o AVAPRO as vezes abre o modal com atraso
     except Exception as e:
         # Antes de retornar erro generico, checa se o AVAPRO exibiu o dialog
         # de erro "Nao foi possivel carregar as parcelas" (erro 400 do servidor).
@@ -1606,7 +1821,7 @@ def selecionar_parcelas_no_modal(
             resultado["erro_retriable"] = True
             resultado["dialog_erro_aberto"] = True  # sinaliza: dialog ainda esta na tela
         else:
-            resultado["erro"] = f"Modal de selecao de parcelas nao apareceu apos 30 segundos: {e}"
+            resultado["erro"] = f"Modal de selecao de parcelas nao apareceu apos 90 segundos: {e}"
             resultado["modal_timeout"] = True  # timeout puro — sem dialog de erro
         return resultado
 
@@ -1653,7 +1868,6 @@ def selecionar_parcelas_no_modal(
         resultado["erro_retriable"] = True
         return resultado
     resultado["vencimento_esperado_dt"] = _dt_selecionada
-    page.wait_for_timeout(300)
 
     # 2) Base pendencia = mesma data do vencimento (evita parcelas de outros
     #    meses). NAO-FATAL: se o dia ja passou o calendario pode bloquear datas
@@ -1669,7 +1883,6 @@ def selecionar_parcelas_no_modal(
         page.wait_for_timeout(400)
     if _dt_base is not None:
         resultado["base_pendencia_dt"] = _dt_base
-    page.wait_for_timeout(300)
 
     # --- Detecta "Nenhuma parcela disponivel para pagamento na data selecionada" ---
     # Faz polling direto no <p> alvo — sem esperar "Atualizando valores..." sumir.
@@ -1856,6 +2069,22 @@ def selecionar_parcelas_no_modal(
 
         parcelas = _ler_parcelas_do_card(page, card)
 
+        # --- FIX (24/07/2026): parcela do MES REF "Futura" vem DISABLED ---
+        # Quando o mes ref e uma parcela ainda nao vencida (ex.: rodando em
+        # julho com mes_ref=agosto), o AVAPRO mostra a parcela do mes ref
+        # como "Futura" com checkbox `disabled` — e o loop abaixo a pularia
+        # (fix #3), classificando a cota como ADIANTADO (count==0) por engano.
+        #
+        # Diferente das parcelas ALEM do mes ref (que nunca queremos), ESTA
+        # precisa ser emitida. Testado no proprio AVAPRO: esperar NAO habilita
+        # o checkbox; so clicar no master "Selecionar todas as parcelas" do
+        # card habilita (e marca as parcelas em atraso de quebra). Depois
+        # re-lemos as parcelas com os checkboxes ja habilitados/re-renderizados.
+        if _card_tem_mes_ref_disabled(parcelas, mes_ref, ano_ref):
+            if _clicar_selecionar_todas_parcelas_card(page, card):
+                page.wait_for_timeout(1000)  # deixa o AVAPRO habilitar/atualizar
+                parcelas = _ler_parcelas_do_card(page, card)
+
         mes_ref_encontrado = False
         parcelas_atraso_count = 0
         cota_selecionadas_count = 0
@@ -1872,23 +2101,69 @@ def selecionar_parcelas_no_modal(
         # (pertencem ao segmento errado — ex: cota Motors no lote Imovel).
         _modalidade_upper = (modalidade or "").upper()
 
+        # --- selecionar_atraso=FALSE: cota com QUALQUER parcela em atraso e
+        #     IGNORADA por inteiro (nao seleciona nem a do mes ref). So emite
+        #     cota SEM nenhuma parcela em atraso. ---
+        if not selecionar_atraso:
+            _tem_atraso = False
+            for _pa in parcelas:
+                _vdta = _pa.get("vencimento_dt")
+                if _vdta is None:
+                    continue
+                _dia_ok = not (
+                    (_modalidade_upper == "IMOVEL" and _vdta.day < 15) or
+                    (_modalidade_upper == "MOTORS" and _vdta.day >= 15)
+                )
+                _e_atraso_a = (
+                    _vdta.year < ano_ref
+                    or (_vdta.year == ano_ref and _vdta.month < mes_ref)
+                )
+                if _dia_ok and _e_atraso_a:
+                    _tem_atraso = True
+                    break
+            if _tem_atraso:
+                # Desmarca tudo do card (caso algo tenha vindo auto-marcado) e
+                # registra a cota inteira como NAO emitida por ter atraso.
+                for _pa in parcelas:
+                    try:
+                        _desmarcar_checkbox_parcela(page, _pa["checkbox_loc"])
+                    except Exception:
+                        pass
+                if chave:
+                    resultado["por_cota"][chave] = {
+                        "parcelas_atraso": 0,
+                        "mes_ref_encontrado": False,
+                        "sem_detalhes": False,
+                        "imoveis": False,
+                    }
+                    resultado["atraso_nao_emitido"].append(chave)
+                continue  # proximo card — cota ignorada por inteiro
+
         for p in parcelas:
             vdt = p.get("vencimento_dt")
+            _cb_p = p["checkbox_loc"]
 
-            # Filtro de dia de vencimento por modalidade
+            # Filtro de dia de vencimento por modalidade.
+            # Parcela de dia ERRADO nao entra — e se o AVAPRO ja marcou
+            # (auto-selecao "Selecionar todas as parcelas"), DESMARCA aqui.
             if vdt is not None:
                 _dia_venc = vdt.day
-                if _modalidade_upper == "IMOVEL" and _dia_venc < 15:
-                    continue  # dia de Motors — ignora neste lote Imovel
-                if _modalidade_upper == "MOTORS" and _dia_venc >= 15:
-                    continue  # dia de Imovel — ignora neste lote Motors
+                _dia_errado = (
+                    (_modalidade_upper == "IMOVEL" and _dia_venc < 15) or
+                    (_modalidade_upper == "MOTORS" and _dia_venc >= 15)
+                )
+                if _dia_errado:
+                    _desmarcar_checkbox_parcela(page, _cb_p)
+                    continue
 
-            # Parcela futura alem do mes ref -> nunca selecionar
+            # Parcela futura alem do mes ref -> nunca selecionar; desmarca se
+            # veio auto-selecionada.
             e_futura = (
                 vdt is not None
                 and (vdt.year > ano_ref or (vdt.year == ano_ref and vdt.month > mes_ref))
             )
             if e_futura:
+                _desmarcar_checkbox_parcela(page, _cb_p)
                 continue
 
             e_mes_ref = (
@@ -2047,97 +2322,19 @@ def selecionar_parcelas_no_modal(
                 "imoveis": False,
             }
             # Adiantado = nenhuma parcela foi selecionavel para esta cota
-            # (nem atraso nem mes ref — ex: cliente adiantado, tudo Futura/disabled)
+            # (nem atraso nem mes ref — ex: cliente adiantado, tudo Futura/disabled).
+            # (cotas com atraso + selecionar_atraso=FALSE ja foram tratadas antes
+            #  do loop, como atraso_nao_emitido.)
             if cota_selecionadas_count == 0:
                 resultado["adiantados_modal"].append(chave)
 
-    # --- Varredura global pos-loop: seleciona TODOS os checkboxes nao marcados
-    # e nao desabilitados que ainda existam no modal.
-    #
-    # Objetivo: garantir que parcelas pre-selecionadas pelo AVAPRO (ou que
-    # escaparam do loop de cards por serem "Futura" alem do mes_ref) sejam
-    # incluidas. Sem isso, o AVAPRO pode exibir -R$ 0,10 ja marcado e R$ 352,21
-    # desmarcado — o footer fica negativo e a cota vai erroneamente para ADIANTADO.
-    #
-    # Estrategia: 3 passagens com 300ms de espera entre elas para cobrir o caso
-    # de checkboxes que ainda nao renderizaram na primeira passagem.
-    _MAX_PASSAGENS_GLOBAL = 3
-    for _passagem in range(_MAX_PASSAGENS_GLOBAL):
-        try:
-            _todos_cb = page.locator('button[role="checkbox"]').all()
-        except Exception:
-            break
-        _algum_clicou = False
-        for _cb_g in _todos_cb:
-            try:
-                # Pula desabilitados
-                if (_cb_g.get_attribute("disabled") is not None
-                        or _cb_g.get_attribute("data-disabled") is not None):
-                    continue
-                # Pula ja marcados
-                _state_g = _cb_g.get_attribute("data-state") or ""
-                _aria_g  = _cb_g.get_attribute("aria-checked") or ""
-                if _state_g == "checked" or _aria_g == "true":
-                    continue
-                # Pula checkboxes de cards marcados como ADIANTADO por valor
-                # negativo — foram desmarcados de proposito e NAO devem ser
-                # remarcados pela varredura global.
-                if _cotas_excluidas_sweep:
-                    try:
-                        _tit_neg = _cb_g.locator(
-                            "xpath=ancestor::div[contains(@class,'rounded-xl')][1]"
-                            "//p[contains(@class,'font-semibold')]"
-                        ).first
-                        _m_neg = _RE_GRUPO_COTA_MODAL.search(
-                            _texto_seguro(_tit_neg, 500)
-                        )
-                        if _m_neg:
-                            _ch_neg = (
-                                _so_digitos(_m_neg.group(1)).zfill(6),
-                                _so_digitos(_m_neg.group(2)).zfill(4),
-                            )
-                            if _ch_neg in _cotas_excluidas_sweep:
-                                continue
-                    except Exception:
-                        pass
-                # Filtro de dia por modalidade: le a data da linha pai (td Vencimento)
-                # para nao selecionar parcelas do segmento errado na varredura global.
-                try:
-                    _venc_td = _cb_g.locator(
-                        "xpath=ancestor::tr[1]/td[3]"
-                    ).first
-                    _venc_txt_g = _texto_seguro(_venc_td, 500)
-                    _vdt_g = _parse_data_pt(_venc_txt_g)
-                    if _vdt_g is not None:
-                        if _modalidade_upper == "IMOVEL" and _vdt_g.day < 15:
-                            continue
-                        if _modalidade_upper == "MOTORS" and _vdt_g.day >= 15:
-                            continue
-                except Exception:
-                    pass
-                # Clica e verifica — dispatch_event nao rola a pagina (evita scroll fantasma)
-                _cb_g.dispatch_event("click")
-                page.wait_for_timeout(300)
-                _state_g2 = _cb_g.get_attribute("data-state") or ""
-                _aria_g2  = _cb_g.get_attribute("aria-checked") or ""
-                if _state_g2 == "checked" or _aria_g2 == "true":
-                    total_selecionadas += 1
-                    _algum_clicou = True
-                else:
-                    # Tentativa com force=True
-                    _cb_g.click(timeout=3000, force=True)
-                    page.wait_for_timeout(300)
-                    _state_g3 = _cb_g.get_attribute("data-state") or ""
-                    _aria_g3  = _cb_g.get_attribute("aria-checked") or ""
-                    if _state_g3 == "checked" or _aria_g3 == "true":
-                        total_selecionadas += 1
-                        _algum_clicou = True
-            except Exception:
-                continue
-        if not _algum_clicou:
-            break  # Nenhum checkbox novo — nao precisa de mais passagens
-        page.wait_for_timeout(300)
-
+    # --- (REMOVIDO 24/07/2026) Varredura global pos-loop ---
+    # A antiga "varredura global" re-selecionava TODOS os checkboxes nao
+    # marcados do modal inteiro (todas as cotas) apos o loop parcela-a-parcela.
+    # Removida a pedido: a selecao agora e SO parcela-a-parcela (atraso + mes
+    # ref, com filtro de dia por modalidade) feita no loop de cards acima.
+    # Mantidos: adiantado, valor negativo, "nenhuma parcela disponivel",
+    # unificacao e a varredura de TODOS os cards. Sem re-selecao global.
     resultado["total_selecionadas"] = total_selecionadas
     resultado["pode_continuar"] = total_selecionadas > 0
     return resultado
@@ -2268,6 +2465,111 @@ def cancelar_modal_parcelas(page) -> None:
         pass
 
 
+def verificar_dias_parcelas_selecionadas(page, modalidade) -> list:
+    """
+    SEGURANCA: apos selecionar as parcelas, confere que TODA parcela MARCADA
+    tem o dia de vencimento compativel com a modalidade:
+        MOTORS  -> dia < 15
+        IMOVEL  -> dia >= 15
+
+    Le precisamente a tabela de parcelas do modal (tr/td), pega o checkbox de
+    cada linha e, se estiver MARCADO, valida o dia da coluna 'Vencimento'.
+
+    Retorna lista de violacoes (parcelas marcadas com dia errado):
+        [{'numero','vencimento','dia'}, ...]
+    Lista vazia = tudo certo.
+    """
+    mod = (modalidade or "").upper()
+    violacoes = []
+    try:
+        rows = page.locator("table tr").all()
+    except Exception:
+        return violacoes
+
+    for row in rows:
+        try:
+            cb = row.locator("button[role='checkbox']").first
+            if cb.count() == 0:
+                continue
+            state = (cb.get_attribute("data-state") or "").lower()
+            aria = (cb.get_attribute("aria-checked") or "").lower()
+            if state != "checked" and aria != "true":
+                continue  # so valida parcelas MARCADAS
+
+            tds = row.locator("td").all()
+            if len(tds) < 3:
+                continue
+            numero = _texto_seguro(tds[1], 500)      # ex '5/220'
+            venc_str = _texto_seguro(tds[2], 500)    # ex '15/07/2026'
+            venc_dt = _parse_data_pt(venc_str)
+            if venc_dt is None:
+                continue
+            dia = venc_dt.day
+            errado = (
+                (mod == "MOTORS" and dia >= 15) or
+                (mod == "IMOVEL" and dia < 15)
+            )
+            if errado:
+                violacoes.append({
+                    "numero": numero, "vencimento": venc_str, "dia": dia,
+                })
+        except Exception:
+            continue
+
+    return violacoes
+
+
+def desmarcar_parcelas_dia_errado(page, modalidade) -> int:
+    """
+    REDE DE SEGURANCA: varre o modal inteiro (todas as tabelas de parcelas de
+    todas as cotas) e DESMARCA toda parcela MARCADA cujo dia de vencimento NAO
+    bate com a modalidade:
+        MOTORS -> mantem so dia < 15
+        IMOVEL -> mantem so dia >= 15
+
+    Serve para remover a auto-selecao do AVAPRO ("Selecionar todas as parcelas"
+    / "Selecionar todas até a data base") que marca parcelas de OUTRA modalidade
+    (ex: parcelas de imovel dia >=15 num lote MOTORS).
+
+    Retorna quantas parcelas desmarcou. Nunca levanta excecao.
+    """
+    mod = (modalidade or "").upper()
+    desmarcadas = 0
+    try:
+        rows = page.locator("table tr").all()
+    except Exception:
+        return 0
+
+    for row in rows:
+        try:
+            cb = row.locator("button[role='checkbox']").first
+            if cb.count() == 0:
+                continue
+            st = (cb.get_attribute("data-state") or "").lower()
+            ar = (cb.get_attribute("aria-checked") or "").lower()
+            if st != "checked" and ar != "true":
+                continue  # so mexe em parcela MARCADA
+
+            tds = row.locator("td").all()
+            if len(tds) < 3:
+                continue
+            venc_dt = _parse_data_pt(_texto_seguro(tds[2], 500))
+            if venc_dt is None:
+                continue
+            dia = venc_dt.day
+            errado = (
+                (mod == "MOTORS" and dia >= 15) or
+                (mod == "IMOVEL" and dia < 15)
+            )
+            if errado:
+                if _desmarcar_checkbox_parcela(page, cb):
+                    desmarcadas += 1
+        except Exception:
+            continue
+
+    return desmarcadas
+
+
 def clicar_continuar_modal_parcelas(page) -> None:
     """
     Clica no botao de confirmacao do modal de selecao de parcelas.
@@ -2300,70 +2602,113 @@ def clicar_continuar_modal_parcelas(page) -> None:
             "— parcelas insuficientes ou apenas creditos selecionados; nao clica 'Gerar boleto'."
         )
 
-    seletores = [
-        "footer button:has-text('Gerar boleto'):not([disabled])",
-        "footer button:has-text('Continuar'):not([disabled])",
-        "button[data-slot='button']:has-text('Gerar boleto'):not([disabled])",
-        "button:has-text('Gerar boleto'):not([disabled])",
-        "button:has-text('Continuar'):not([disabled])",
-    ]
-
-    btn_encontrado = None
-    for sel in seletores:
+    def _achar_botao():
+        # role-based e o mais preciso: casa exatamente pelo texto do botao.
         try:
-            loc = page.locator(sel).first
-            if loc.count() == 0:
-                continue
-            loc.wait_for(state="visible", timeout=10000)
-            btn_encontrado = loc
-            break
+            b = page.get_by_role("button", name="Gerar boleto")
+            if b.count() > 0:
+                return b.first
         except Exception:
+            pass
+        try:
+            b = page.get_by_role("button", name="Continuar")
+            if b.count() > 0:
+                return b.first
+        except Exception:
+            pass
+        for sel in (
+            "button[data-slot='button']:has-text('Gerar boleto')",
+            "footer button:has-text('Gerar boleto')",
+            "button:has-text('Gerar boleto')",
+            "button:has-text('Continuar')",
+        ):
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0:
+                    return loc
+            except Exception:
+                continue
+        return None
+
+    def _modal_parcelas_aberto():
+        try:
+            h = page.locator(
+                "h2:text-matches('Selecione as parcelas', 'i')"
+            ).first
+            return h.count() > 0 and h.is_visible()
+        except Exception:
+            return False
+
+    ultimo_erro = "nenhum"
+
+    # Ate 4 tentativas de clique, VERIFICANDO se o modal de parcelas fechou
+    # (indicando que avancou para a tela de pagamento). Se nao avancou, tenta
+    # de novo com outra estrategia de clique.
+    for _tent in range(1, 5):
+        btn = _achar_botao()
+        if btn is None:
+            page.wait_for_timeout(500)
             continue
 
-    if btn_encontrado is None:
-        raise RuntimeError("Botao 'Gerar boleto'/'Continuar' nao encontrado no modal")
+        # Espera o botao ficar HABILITADO (o AVAPRO desabilita durante
+        # "Atualizando valores..."). Ate ~5s.
+        for _e in range(25):
+            try:
+                if btn.is_enabled():
+                    break
+            except Exception:
+                pass
+            page.wait_for_timeout(200)
 
-    # Garante que o botao esta no viewport, rolando APENAS o container do proprio
-    # botao (o footer/modal), nunca o body — evita o "scroll fantasma" da tela de tras.
-    try:
-        btn_encontrado.scroll_into_view_if_needed(timeout=3000)
-        page.wait_for_timeout(150)
-    except Exception:
-        pass
+        try:
+            btn.scroll_into_view_if_needed(timeout=2000)
+            page.wait_for_timeout(150)
+        except Exception:
+            pass
 
-    # Tentativa 1 (PRINCIPAL): dispatch_event('click') do Playwright.
-    # Dispara o evento de clique diretamente no elemento EXATO do botao, sem
-    # mover o mouse nem depender de coordenadas — assim o clique NUNCA cai no
-    # fundo da pagina (causa do scroll fantasma). Puro Python/Playwright.
-    try:
-        btn_encontrado.dispatch_event("click")
-        page.wait_for_timeout(300)
-        return
-    except Exception:
-        pass
+        # Camadas de clique: normal -> posicional -> force -> dispatch_event.
+        _clicou = False
+        try:
+            btn.click(timeout=5000)
+            _clicou = True
+        except Exception as e:
+            ultimo_erro = f"click normal: {e}"
+        if not _clicou:
+            try:
+                box = btn.bounding_box()
+                if box:
+                    page.mouse.click(
+                        box["x"] + box["width"] / 2,
+                        box["y"] + box["height"] / 2,
+                    )
+                    _clicou = True
+            except Exception as e:
+                ultimo_erro = f"click posicional: {e}"
+        if not _clicou:
+            try:
+                btn.click(timeout=4000, force=True)
+                _clicou = True
+            except Exception as e:
+                ultimo_erro = f"click force: {e}"
+        if not _clicou:
+            try:
+                btn.dispatch_event("click")
+                _clicou = True
+            except Exception as e:
+                ultimo_erro = f"dispatch_event: {e}"
 
-    # Tentativa 2: clique posicional no centro exato do botao (bounding box),
-    # sem o auto-scroll do Playwright que pode acertar o fundo.
-    try:
-        box = btn_encontrado.bounding_box()
-        if box:
-            page.mouse.click(
-                box["x"] + box["width"] / 2,
-                box["y"] + box["height"] / 2,
-            )
-            page.wait_for_timeout(300)
+        # VERIFICA se avancou (modal de parcelas fechou). Se sim, sucesso.
+        page.wait_for_timeout(1500)
+        if not _modal_parcelas_aberto():
             return
-    except Exception:
-        pass
 
-    # Tentativa 3: force=True — ignora elementos interceptando o clique.
-    try:
-        btn_encontrado.click(timeout=6000, force=True)
-        return
-    except Exception as e:
-        raise RuntimeError(
-            f"Botao 'Gerar boleto'/'Continuar' encontrado mas nao foi possivel clicar: {e}"
-        )
+        # Ainda no modal de parcelas — o clique nao surtiu efeito. Tenta de novo.
+        page.wait_for_timeout(600)
+
+    raise RuntimeError(
+        "Cliquei em 'Gerar boleto' mas o modal de parcelas nao avancou apos "
+        f"4 tentativas (ultimo_erro={ultimo_erro})."
+    )
 
 
 def ler_dados_modal_pagamento(page, timeout_ms: int = 15000) -> Dict[str, Any]:
@@ -2392,23 +2737,52 @@ def ler_dados_modal_pagamento(page, timeout_ms: int = 15000) -> Dict[str, Any]:
         pass
 
     # --- Vencimento: "Data de vencimento: 15/06/2026" ---
+    # IMPORTANTE (fix): NAO ler cedo demais. Logo apos "Gerar boleto"/"Continuar"
+    # o modal pode exibir transitoriamente OUTRA data (ex: hoje) antes de a linha
+    # "Data de vencimento" renderizar. Antes, o seletor aceitava qualquer <p> com
+    # um padrao de data, entao numa leitura instantanea (0,02s) pegava a data de
+    # hoje -> falso "vencimento incorreto" -> re-emissao indevida.
+    #
+    # Agora: da PRIORIDADE ao <p> que contem a palavra "vencimento" + data, e faz
+    # POLLING ate timeout_ms esperando essa linha aparecer. So usa uma data "solta"
+    # (sem o rotulo) como ULTIMO recurso, se nada rotulado aparecer no periodo.
     _sels_venc = [
-        "p.text-sm.text-muted-foreground",
         "p:has-text('Data de vencimento')",
-        "p:text-matches('Data de vencimento', 'i')",
+        "p:text-matches('vencimento', 'i')",
+        "p.text-sm.text-muted-foreground",
     ]
-    for _sel in _sels_venc:
-        try:
-            for _loc in page.locator(_sel).all():
-                _txt = _texto_seguro(_loc, 1000)
-                if "vencimento" in _txt.lower() or re.search(r"\d{2}/\d{2}/\d{4}", _txt):
-                    dados["vencimento_str"] = _txt
-                    dados["vencimento_dt"] = _parse_data_pt(_txt)
+    _venc_deadline = time.time() + timeout_ms / 1000
+    _bare_str = None
+    _bare_dt = None
+    while time.time() < _venc_deadline:
+        for _sel in _sels_venc:
+            try:
+                for _loc in page.locator(_sel).all():
+                    _txt = _texto_seguro(_loc, 1000)
+                    if not re.search(r"\d{2}/\d{2}/\d{4}", _txt):
+                        continue
+                    if "vencimento" in _txt.lower():
+                        # Linha rotulada "vencimento" com data -> valor confiavel
+                        dados["vencimento_str"] = _txt
+                        dados["vencimento_dt"] = _parse_data_pt(_txt)
+                        break
+                    # Data sem o rotulo "vencimento": guarda so como fallback
+                    if _bare_dt is None:
+                        _bare_str = _txt
+                        _bare_dt = _parse_data_pt(_txt)
+                if dados["vencimento_dt"] is not None:
                     break
-            if dados["vencimento_dt"] is not None:
-                break
-        except Exception:
-            continue
+            except Exception:
+                continue
+        if dados["vencimento_dt"] is not None:
+            break
+        page.wait_for_timeout(200)
+
+    # Ultimo recurso: nenhuma linha rotulada "vencimento" apareceu no periodo —
+    # usa a data solta encontrada (melhor que nada), se houver.
+    if dados["vencimento_dt"] is None and _bare_dt is not None:
+        dados["vencimento_str"] = _bare_str
+        dados["vencimento_dt"] = _bare_dt
 
     # --- Valor: "R$ 341,54" (paragrafo bold/2xl) ---
     _sels_valor = [
